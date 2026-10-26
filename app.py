@@ -444,11 +444,45 @@ def _paged_get(path, params, what, quiet=False):
     return records
 
 
+@st.cache_data(ttl=3600)  # field structure changes rarely, if ever
+def get_reseller_field_api_name():
+    """The Accounts module's 'Reseller' field API name, looked up by its on-screen label
+    (like the Amount lookup below). None if it can't be found, so the app still works without it."""
+    try:
+        token = get_access_token()
+        resp = requests.get(
+            f"{ZOHO_API_DOMAIN}/crm/v2/settings/fields",
+            headers={"Authorization": f"Zoho-oauthtoken {token}"},
+            params={"module": "Accounts"},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return None
+        for field in resp.json().get("fields", []):
+            if (field.get("field_label") or "").strip().lower() == "reseller":
+                return field.get("api_name")
+    except Exception:
+        return None
+    return None
+
+
+def reseller_name(value):
+    """Picklist (text) or lookup ({name, id}) — either way, just the name."""
+    if isinstance(value, dict):
+        return (value.get("name") or "").strip()
+    return str(value or "").strip()
+
+
+NO_RESELLER = "No reseller (ours)"
+
+
 @st.cache_data(ttl=60)
 def load_accounts():
+    reseller_field = get_reseller_field_api_name()
+    fields = ACCOUNT_FIELDS + (f",{reseller_field}" if reseller_field else "")
     records = _paged_get(
         "Accounts",
-        {"fields": ACCOUNT_FIELDS, "sort_by": "Modified_Time", "sort_order": "desc"},
+        {"fields": fields, "sort_by": "Modified_Time", "sort_order": "desc"},
         "Accounts",
     )
 
@@ -471,6 +505,7 @@ def load_accounts():
                 "Account ID": r.get("id"),
                 "Account Name": r.get("Account_Name") or "",
                 "Account Owner": (r.get("Owner") or {}).get("name") or "",
+                "Reseller": reseller_name(r.get(reseller_field)) if reseller_field else "",
                 "All Tags": ", ".join(sorted(tag_names)),
                 "Primary Contact": r.get("Primary_Contact_Name") or "",
                 "Primary Contact Number": r.get("Primary_Contact_Number") or "",
@@ -807,6 +842,24 @@ render_html(
     '<div class="pe-status-row"><span class="dot"></span> Connected to Zoho CRM</div>',
     target=st.sidebar,
 )
+
+# --- Reseller filter (sidebar): blank = our own customers, or a reseller such as FT Security Systems ---
+df["Reseller"] = df.get("Reseller", pd.Series("", index=df.index)).fillna("").replace("", NO_RESELLER)
+reseller_options = [NO_RESELLER] + sorted(r for r in df["Reseller"].unique() if r != NO_RESELLER)
+if "reseller_filter" not in st.session_state:
+    st.session_state["reseller_filter"] = list(reseller_options)  # Everyone, until someone narrows it
+else:  # Keep the choice, dropping any option that no longer exists
+    st.session_state["reseller_filter"] = [r for r in st.session_state["reseller_filter"] if r in reseller_options]
+selected_resellers = st.sidebar.multiselect(
+    "Reseller", reseller_options, key="reseller_filter",
+    help="Whose customers to show. 'No reseller (ours)' is accounts with the Reseller field blank in Zoho.",
+)
+if not get_reseller_field_api_name():
+    st.sidebar.caption("⚠️ Couldn't find a 'Reseller' field on Accounts in Zoho, so every account shows as ours.")
+df = df[df["Reseller"].isin(selected_resellers)].copy()
+reseller_label = ("All resellers" if len(selected_resellers) == len(reseller_options)
+                  else ", ".join(selected_resellers) or "none selected")
+
 render_html(
     '<div class="pe-mini-grid">'
     f'<div class="pe-mini"><div class="l">Customers</div><div class="v">{len(df)}</div></div>'
@@ -892,7 +945,8 @@ with tab_renewals:
                 render_html(kpi_tile(label, value, href=anchor, tone=tone))
         report["ren_tiles"] = tiles
         report["ren_filters"] = (
-            "Urgency: " + (", ".join(selected_urgency) if selected_urgency else "none selected")
+            f"Reseller: {reseller_label}  -  "
+            + "Urgency: " + (", ".join(selected_urgency) if selected_urgency else "none selected")
             + (f"  -  Search: {name_search}" if name_search else "")
         )
 
