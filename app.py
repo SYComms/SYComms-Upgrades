@@ -1887,6 +1887,33 @@ def get_lead_source_options():
     return sorted(dict.fromkeys(names), key=str.lower)
 
 
+LEAD_FIELD_LIST = "Last_Name,First_Name,Company,Lead_Source,Lead_Status,Created_Time,Created_By,Converted__s"
+
+
+def _enrich_leads(records, headers):
+    """Zoho's search can return a slimmed-down record with no Created Time / Status. For those, fetch the
+    fields we need by id (100 per call). Returns the records with the extras merged in."""
+    missing = [r["id"] for r in records if r.get("id") and "Created_Time" not in r]
+    if not missing:
+        return records
+    by_id = {}
+    for i in range(0, len(missing), 100):
+        chunk = ",".join(missing[i:i + 100])
+        for extra in ({"converted": "both"}, {}):
+            try:
+                resp = requests.get(
+                    f"{ZOHO_API_DOMAIN}/crm/v2/Leads", headers=headers, timeout=30,
+                    params={"ids": chunk, "fields": LEAD_FIELD_LIST, **extra},
+                )
+            except Exception:
+                break
+            if resp.status_code == 200:
+                for rec in resp.json().get("data", []):
+                    by_id[rec.get("id")] = rec
+                break
+    return [{**r, **by_id.get(r.get("id"), {})} for r in records]
+
+
 def _crit_escape(value):
     """Zoho search criteria treat ( ) , and backslash as special - escape them in a value."""
     return re.sub(r"([\\(),])", r"\\\1", value)
@@ -1911,25 +1938,30 @@ def _search_leads_for_source(source, since_iso, headers):
     for how, params, is_timed in variants:
         if is_timed and timed_came_back_empty:
             continue
-        records, page, ok = [], 1, True
-        while True:
-            try:
-                resp = requests.get(
-                    f"{ZOHO_API_DOMAIN}/crm/v2/Leads/search", headers=headers,
-                    params={**params, "per_page": 200, "page": page}, timeout=30,
-                )
-            except Exception as err:
-                raise RuntimeError(f"Could not reach Zoho CRM API for Leads. Details: {err}")
-            if resp.status_code == 204:
+        records, ok = [], False
+        for with_fields in (True, False):
+            extra = {"fields": LEAD_FIELD_LIST} if with_fields else {}
+            records, page, ok = [], 1, True
+            while True:
+                try:
+                    resp = requests.get(
+                        f"{ZOHO_API_DOMAIN}/crm/v2/Leads/search", headers=headers,
+                        params={**params, **extra, "per_page": 200, "page": page}, timeout=30,
+                    )
+                except Exception as err:
+                    raise RuntimeError(f"Could not reach Zoho CRM API for Leads. Details: {err}")
+                if resp.status_code == 204:
+                    break
+                if resp.status_code != 200:
+                    last, ok = f"status {resp.status_code}: {resp.text}", False
+                    break
+                payload = resp.json()
+                records.extend(payload.get("data", []))
+                if not payload.get("info", {}).get("more_records") or page >= 10:  # Zoho search caps at 2,000 records
+                    break
+                page += 1
+            if ok:
                 break
-            if resp.status_code != 200:
-                last, ok = f"status {resp.status_code}: {resp.text}", False
-                break
-            payload = resp.json()
-            records.extend(payload.get("data", []))
-            if not payload.get("info", {}).get("more_records") or page >= 10:  # Zoho search caps at 2,000 records
-                break
-            page += 1
         if not ok:
             continue
         if records:
@@ -1951,12 +1983,13 @@ def load_leads_for_sources(sources, since_iso):
     records, diag = [], []
     for source in sources:
         found, how = _search_leads_for_source(source, since_iso, headers)
+        found = _enrich_leads(found, headers)
         records.extend(found)
         stamps = [parse_appt(r.get("Created_Time")) for r in found]
         stamps = [t for t in stamps if pd.notna(t)]
         diag.append(
             {
-                "source": source, "how": how, "returned": len(found),
+                "source": source, "how": how, "returned": len(found), "dated": len(stamps),
                 "newest": max(stamps) if stamps else None, "oldest": min(stamps) if stamps else None,
             }
         )
@@ -2557,6 +2590,11 @@ def render_assessment():
                 span = (f", created between {dgn['oldest']:%d %b %Y} and {dgn['newest']:%d %b %Y}"
                         if dgn["newest"] is not None else "")
                 st.write(f"**{dgn['source']}** - Zoho returned {dgn['returned']:,} lead(s){span} ({dgn['how']}).")
+                if dgn["returned"] and dgn["dated"] < dgn["returned"]:
+                    st.warning(
+                        f"Only {dgn['dated']:,} of those {dgn['returned']:,} came back with a Created Time, so the rest "
+                        "can't be placed in a time frame."
+                    )
             st.caption(
                 f"Only leads whose Created Time falls in {label} are counted above "
                 f"({leads_now['added']:,} of the {sum(d['returned'] for d in lead_diag):,} returned)."
