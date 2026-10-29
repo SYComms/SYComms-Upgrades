@@ -1892,10 +1892,11 @@ LEAD_FIELD_LIST = "Last_Name,First_Name,Company,Lead_Source,Lead_Status,Created_
 
 def _enrich_leads(records, headers):
     """Zoho's search can return a slimmed-down record with no Created Time / Status. For those, fetch the
-    fields we need by id (100 per call). Returns the records with the extras merged in."""
+    fields we need by id (100 per call). Returns (records with the extras merged in, what happened)."""
     missing = [r["id"] for r in records if r.get("id") and "Created_Time" not in r]
+    info = {"needed": len(missing), "fetched": 0, "error": ""}
     if not missing:
-        return records
+        return records, info
     by_id = {}
     for i in range(0, len(missing), 100):
         chunk = ",".join(missing[i:i + 100])
@@ -1905,13 +1906,16 @@ def _enrich_leads(records, headers):
                     f"{ZOHO_API_DOMAIN}/crm/v2/Leads", headers=headers, timeout=30,
                     params={"ids": chunk, "fields": LEAD_FIELD_LIST, **extra},
                 )
-            except Exception:
+            except Exception as err:
+                info["error"] = f"could not reach Zoho: {err}"
                 break
             if resp.status_code == 200:
                 for rec in resp.json().get("data", []):
                     by_id[rec.get("id")] = rec
                 break
-    return [{**r, **by_id.get(r.get("id"), {})} for r in records]
+            info["error"] = f"status {resp.status_code}: {resp.text[:300]}"
+    info["fetched"] = len(by_id)
+    return [{**r, **by_id.get(r.get("id"), {})} for r in records], info
 
 
 def _crit_escape(value):
@@ -1983,13 +1987,15 @@ def load_leads_for_sources(sources, since_iso):
     records, diag = [], []
     for source in sources:
         found, how = _search_leads_for_source(source, since_iso, headers)
-        found = _enrich_leads(found, headers)
+        raw_keys = sorted(found[0].keys()) if found else []
+        found, enrich = _enrich_leads(found, headers)
         records.extend(found)
         stamps = [parse_appt(r.get("Created_Time")) for r in found]
         stamps = [t for t in stamps if pd.notna(t)]
         diag.append(
             {
                 "source": source, "how": how, "returned": len(found), "dated": len(stamps),
+                "raw_keys": raw_keys, "enrich": enrich,
                 "newest": max(stamps) if stamps else None, "oldest": min(stamps) if stamps else None,
             }
         )
@@ -2591,6 +2597,12 @@ def render_assessment():
                         if dgn["newest"] is not None else "")
                 st.write(f"**{dgn['source']}** - Zoho returned {dgn['returned']:,} lead(s){span} ({dgn['how']}).")
                 if dgn["returned"] and dgn["dated"] < dgn["returned"]:
+                    en = dgn["enrich"]
+                    st.caption(
+                        f"Fields in Zoho's search result: {', '.join(dgn['raw_keys']) or '(none)'}.  "
+                        f"Looked up the rest by id: {en['fetched']:,} of {en['needed']:,}"
+                        + (f" - Zoho said: {en['error']}" if en["error"] else "") + "."
+                    )
                     st.warning(
                         f"Only {dgn['dated']:,} of those {dgn['returned']:,} came back with a Created Time, so the rest "
                         "can't be placed in a time frame."
