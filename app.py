@@ -3153,6 +3153,20 @@ def render_assessment():
         (str(r["Stage"]), int(r["Deals"]), STAGE_DOT_COLORS.get(str(r["Stage"]).lower(), "#7C83FF"))
         for _, r in (created["Status"].replace("", "(no stage)").value_counts().rename_axis("Stage").reset_index(name="Deals").iterrows())
     ]
+    pdf_conv_list = [
+        [c["lead"]["Created Time"].strftime("%d/%m/%Y"), c["lead"]["Name"], c["lead"]["Company"],
+         (c["deal"]["Client Name"] if c["deal"] is not None else "-"),
+         (c["deal"]["Status"] if c["deal"] is not None else "-"),
+         "Yes" if c["won"] else ("No" if c["deal"] is not None else "-")]
+        for c in sorted(conv_added, key=lambda c: c["lead"]["Created Time"], reverse=True)
+    ]
+    pdf_won_list = [
+        [fmt_date_uk(c["closed"]), c["deal"]["Client Name"], money(c["deal"]["Total Lease Value"]), c["lead"]["Name"],
+         c["lead"]["Source"],
+         (c["lead"]["Created Time"].strftime("%d/%m/%Y") if pd.notna(c["lead"]["Created Time"]) else "earlier"),
+         (c["converted_on"].strftime("%d/%m/%Y") if pd.notna(c["converted_on"]) else "-")]
+        for c in sorted(cl_now["won_in"], key=lambda c: c["closed"], reverse=True)
+    ]
     report["assessment"] = {
         "person": person, "tf": tf, "label": label, "compare": compare_label,
         "deal_tiles": deal_tiles, "call_tiles": call_tiles, "points": points,
@@ -3166,6 +3180,8 @@ def render_assessment():
         "lead_tiles": lead_tiles, "lead_names": ", ".join(lead_sel), "lead_bins": lead_bins_total,
         "lead_sources": lead_src_rows, "lead_status": lead_status_rows, "lead_conv": lead_conv_rows,
         "deal_sources": deal_src_rows,
+        "lead_tiles2": lead_tiles2, "lead_tiles3": lead_tiles3,
+        "conv_list": pdf_conv_list, "conv_won_list": pdf_won_list,
         "conv_funnel": None if not conv_links else (len(conv_added), n_conv_deal, n_conv_won, conv_won_value),
         "conv_period": None if not conv_links else (len(cl_now["conv_in"]), len(cl_now["won_in"]), cl_now["won_in_value"]),
     }
@@ -3526,8 +3542,15 @@ if REPORTLAB_OK:
                  Paragraph("PHONE CALLS  -  outbound, from the Grandstream UCM call records", st["lbl"]), Spacer(1, 1.5 * mm),
                  _KpiRow(W, A["call_tiles"]), Spacer(1, 3.5 * mm)]
         if A.get("lead_tiles"):
-            story += [Paragraph(f"LEADS THEY ADDED  -  lead source(s): {_t(A['lead_names'])}", st["lbl"]), Spacer(1, 1.5 * mm),
+            story += [Paragraph(f"LEADS ADDED IN {_t(A['label']).upper()}  -  lead source(s): {_t(A['lead_names'])}", st["lbl"]), Spacer(1, 1.5 * mm),
                       _KpiRow(W, A["lead_tiles"]), Spacer(1, 3.5 * mm)]
+            if A.get("lead_tiles2"):
+                story += [Paragraph(f"WHAT BECAME OF THE LEADS ADDED IN {_t(A['label']).upper()}", st["lbl"]), Spacer(1, 1.5 * mm),
+                          _KpiRow(W, A["lead_tiles2"]), Spacer(1, 3.5 * mm)]
+            if A.get("lead_tiles3"):
+                story += [Paragraph(f"CONVERTED AND WON IN {_t(A['label']).upper()}  -  from these sources, whenever the lead was added",
+                                    st["lbl"]), Spacer(1, 1.5 * mm),
+                          _KpiRow(W, A["lead_tiles3"]), Spacer(1, 3.5 * mm)]
         story.append(_callout(st, W, [md_bold(p, lambda t, b: _bold(t) if b else _t(t)) for p in A["points"]]))
         story.append(Spacer(1, 4 * mm))
 
@@ -3591,21 +3614,41 @@ if REPORTLAB_OK:
         if A["created_rows"]:
             story.append(CondPageBreak(50 * mm))
             story += [Paragraph(f"DEALS CREATED  -  {A['n_created']} in the period", st["lbl"]), Spacer(1, 1.5 * mm)]
-            rows = [[r[0], {"t": r[1], "bold": True}, r[2], r[3], r[4], r[5], r[6]] for r in A["created_rows"][:6]]
+            rows = [[r[0], {"t": r[1], "bold": True}, r[2], r[3], r[4], r[5], r[6]] for r in A["created_rows"][:4]]
             story.append(_table(st, ["Created", "Deal", "Account", "Booked for", "Stage", "Lead source", "Appointment"], rows,
                                 [23 * mm, 33 * mm, 28 * mm, 24 * mm, 22 * mm, 26 * mm, 26 * mm]))
-            if len(A["created_rows"]) > 6:
-                story += [Spacer(1, 1 * mm), Paragraph(f"Showing the latest 6 of {len(A['created_rows'])} - the full list is in the app.", st["note"])]
+            if len(A["created_rows"]) > 4:
+                story += [Spacer(1, 1 * mm), Paragraph(f"Showing the latest 4 of {len(A['created_rows'])} - the full list is in the app.", st["note"])]
             story.append(Spacer(1, 3 * mm))
         if A["won_rows"]:
             story.append(CondPageBreak(40 * mm))
             story += [Paragraph(f"CLOSED WON IN THE PERIOD  -  {A['n_won']} deal(s), {_t(money_short(A['won_value']))} lease value", st["lbl"]),
                       Spacer(1, 1.5 * mm)]
-            rows = [[{"t": r[0], "bold": True}, r[1], r[2], r[3], r[4]] for r in A["won_rows"][:5]]
+            rows = [[{"t": r[0], "bold": True}, r[1], r[2], r[3], r[4]] for r in A["won_rows"][:4]]
             story.append(_table(st, ["Deal", "Booked for", "Closed", "Monthly network", "Lease value"], rows,
                                 [62 * mm, 40 * mm, 24 * mm, 28 * mm, 28 * mm], right=(3, 4)))
-            if len(A["won_rows"]) > 5:
-                story += [Spacer(1, 1 * mm), Paragraph(f"Showing the latest 5 of {len(A['won_rows'])} - the full list is in the app.", st["note"])]
+            if len(A["won_rows"]) > 4:
+                story += [Spacer(1, 1 * mm), Paragraph(f"Showing the latest 4 of {len(A['won_rows'])} - the full list is in the app.", st["note"])]
+        if A.get("conv_won_list"):
+            story.append(CondPageBreak(40 * mm))
+            story += [Spacer(1, 3 * mm),
+                      Paragraph(f"DEALS WON FROM THESE LEAD SOURCES  -  {len(A['conv_won_list'])} in the period, whenever the lead was added",
+                                st["lbl"]), Spacer(1, 1.5 * mm)]
+            rows = [[r[0], {"t": r[1], "bold": True}, r[2], r[3], r[4], r[5], r[6]] for r in A["conv_won_list"][:4]]
+            story.append(_table(st, ["Closed", "Deal", "Lease value", "Lead", "Source", "Lead added", "Converted"], rows,
+                                [22 * mm, 40 * mm, 22 * mm, 30 * mm, 30 * mm, 19 * mm, 19 * mm], right=(2,)))
+            if len(A["conv_won_list"]) > 4:
+                story += [Spacer(1, 1 * mm), Paragraph(f"Showing the latest 4 of {len(A['conv_won_list'])} - the full list is in the app.", st["note"])]
+        if A.get("conv_list"):
+            story.append(CondPageBreak(40 * mm))
+            story += [Spacer(1, 3 * mm),
+                      Paragraph(f"LEADS ADDED IN THE PERIOD THAT HAVE CONVERTED  -  {len(A['conv_list'])}, and what each became", st["lbl"]),
+                      Spacer(1, 1.5 * mm)]
+            rows = [[r[0], {"t": r[1], "bold": True}, r[2], r[3], r[4], r[5]] for r in A["conv_list"][:4]]
+            story.append(_table(st, ["Lead added", "Lead", "Company", "Deal", "Deal stage", "Won?"], rows,
+                                [22 * mm, 30 * mm, 38 * mm, 40 * mm, 31 * mm, 21 * mm]))
+            if len(A["conv_list"]) > 4:
+                story += [Spacer(1, 1 * mm), Paragraph(f"Showing the latest 4 of {len(A['conv_list'])} - the full list is in the app.", st["note"])]
         return story
 
     def _render_pdf(story, title):
