@@ -1961,6 +1961,124 @@ def probe_lead_dates(sample_id):
     return lines
 
 
+# ---- dating leads from their Timeline ----
+# Some Zoho orgs hide Created Time on Leads completely (not in the list, the filters, or the API) - but each lead's
+# Timeline still records when it was added and by whom. Record ids only ever go up, so we find where the chosen
+# period starts with a handful of look-ups (a binary search by id) and read the Timeline only for the leads after it.
+TIMELINE_PATHS = ["/crm/v3/Leads/{id}/__timeline", "/crm/v2.1/Leads/{id}/__timeline", "/crm/v2/Leads/{id}/__timeline"]
+TIMELINE_MAX_LEADS = 1500
+_TIMELINE_CACHE = {}  # lead id -> (created ISO text, created-by name); a lead's creation never changes
+_TIMELINE_LOCK = None
+
+
+def _timeline_lock():
+    global _TIMELINE_LOCK
+    if _TIMELINE_LOCK is None:
+        import threading
+        _TIMELINE_LOCK = threading.Lock()
+    return _TIMELINE_LOCK
+
+
+def _lead_created_from_timeline(rid, headers, track):
+    """(created ISO text, created-by name) for one lead from its Timeline, or None. `track` is a dict that
+    remembers the working URL style and the first problem seen (shared by every call in one load)."""
+    with _timeline_lock():
+        if rid in _TIMELINE_CACHE:
+            return _TIMELINE_CACHE[rid]
+    paths = [track["path"]] if track.get("path") else TIMELINE_PATHS
+    for path in paths:
+        earliest, page = None, 1
+        while page <= 6:
+            try:
+                resp = requests.get(
+                    f"{ZOHO_API_DOMAIN}{path.format(id=rid)}", headers=headers, timeout=30,
+                    params={"per_page": 50, "page": page},
+                )
+            except Exception as err:
+                track.setdefault("error", f"could not reach Zoho: {err}")
+                return None
+            if resp.status_code == 204:
+                if page == 1:
+                    track["path"] = path
+                break
+            if resp.status_code != 200:
+                track.setdefault("error", f"{path.split('/')[2]} timeline: status {resp.status_code}: {resp.text[:200]}")
+                break
+            track["path"] = path
+            try:
+                body = resp.json()
+            except ValueError:
+                break
+            events = body.get("__timeline") or body.get("timeline") or []
+            track.setdefault("sample", str(events[:1])[:400])
+            for ev in events:
+                when = ev.get("audited_time") or ev.get("time")
+                if str(ev.get("action", "")).lower() == "added" and when:
+                    out = (when, ((ev.get("done_by") or {}).get("name") or ""))
+                    with _timeline_lock():
+                        _TIMELINE_CACHE[rid] = out
+                    return out
+                if when and (earliest is None or when < earliest[0]):
+                    earliest = (when, ((ev.get("done_by") or {}).get("name") or ""))
+            if not body.get("info", {}).get("more_records") and not (body.get("info") or {}).get("more"):
+                break
+            page += 1
+        else:
+            earliest = None  # never reached the first event of a very long history
+        if track.get("path") == path:  # this URL style works; an 'added' entry just wasn't there
+            if earliest:
+                with _timeline_lock():
+                    _TIMELINE_CACHE[rid] = earliest
+            return earliest
+    return None
+
+
+def date_leads_from_timeline(records, since_iso, headers):
+    """Fill in Created_Time / Created_By on lead records from the Timeline, for the leads that could be inside the
+    period (found by binary search on record id). Returns (records, info)."""
+    from concurrent.futures import ThreadPoolExecutor
+    info = {"used": True, "dated": 0, "looked_up": 0, "probes": 0, "capped": False, "error": "", "path": "", "sample": ""}
+    since = parse_appt(since_iso)
+    ids = sorted({r["id"] for r in records if r.get("id") and str(r["id"]).isdigit()}, key=int)
+    if not ids or pd.isna(since):
+        return records, info
+    track = {}
+
+    def stamp(rid):
+        got = _lead_created_from_timeline(rid, headers, track)
+        info["looked_up"] += 1
+        return parse_appt(got[0]) if got else pd.NaT
+
+    lo, hi = 0, len(ids)  # first index whose lead was created on/after `since`
+    broke = False
+    while lo < hi:
+        mid = (lo + hi) // 2
+        info["probes"] += 1
+        t = stamp(ids[mid])
+        if pd.isna(t):
+            broke = True
+            break
+        if t >= since:
+            hi = mid
+        else:
+            lo = mid + 1
+    first = max(0, (lo if not broke else len(ids) - TIMELINE_MAX_LEADS) - 3)  # a little slack for out-of-order ids
+    todo = ids[first:]
+    if len(todo) > TIMELINE_MAX_LEADS:
+        todo, info["capped"] = todo[-TIMELINE_MAX_LEADS:], True
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda r: _lead_created_from_timeline(r, headers, track), todo))
+    out = []
+    for r in records:
+        got = _TIMELINE_CACHE.get(r.get("id"))
+        if got and not r.get("Created_Time"):
+            r = {**r, "Created_Time": got[0], **({"Created_By": {"name": got[1]}} if got[1] else {})}
+        out.append(r)
+    info.update(dated=sum(1 for r in out if r.get("Created_Time")), error=track.get("error", ""),
+                path=track.get("path", ""), sample=track.get("sample", ""), checked=len(todo))
+    return out, info
+
+
 def _crit_escape(value):
     """Zoho search criteria treat ( ) , and backslash as special - escape them in a value."""
     return re.sub(r"([\\(),])", r"\\\1", value)
@@ -2032,13 +2150,16 @@ def load_leads_for_sources(sources, since_iso):
         found, how = _search_leads_for_source(source, since_iso, headers)
         raw_keys = sorted(found[0].keys()) if found else []
         found, enrich = _enrich_leads(found, headers)
+        timeline = None
+        if found and not any(r.get("Created_Time") for r in found):
+            found, timeline = date_leads_from_timeline(found, since_iso, headers)
         records.extend(found)
         stamps = [parse_appt(r.get("Created_Time")) for r in found]
         stamps = [t for t in stamps if pd.notna(t)]
         diag.append(
             {
                 "source": source, "how": how, "returned": len(found), "dated": len(stamps),
-                "raw_keys": raw_keys, "enrich": enrich, "sample_id": (found[0].get("id") if found else None),
+                "raw_keys": raw_keys, "enrich": enrich, "timeline": timeline, "sample_id": (found[0].get("id") if found else None),
                 "newest": max(stamps) if stamps else None, "oldest": min(stamps) if stamps else None,
             }
         )
@@ -2639,7 +2760,18 @@ def render_assessment():
                 span = (f", created between {dgn['oldest']:%d %b %Y} and {dgn['newest']:%d %b %Y}"
                         if dgn["newest"] is not None else "")
                 st.write(f"**{dgn['source']}** - Zoho returned {dgn['returned']:,} lead(s){span} ({dgn['how']}).")
-                if dgn["returned"] and dgn["dated"] < dgn["returned"]:
+                tl = dgn.get("timeline")
+                if tl:
+                    st.caption(
+                        "Zoho doesn't hand out a Created Time for Leads, so each lead's creation date was read from its "
+                        f"Timeline: {tl.get('checked', 0):,} of the newest leads checked (found by record number, "
+                        f"{tl['probes']} look-ups to locate where this period starts), {tl['dated']:,} dated."
+                    )
+                    if tl["capped"]:
+                        st.warning(f"That's a lot of leads, so only the newest {TIMELINE_MAX_LEADS:,} were checked.")
+                    if tl["error"] and not tl["dated"]:
+                        st.warning(f"Couldn't read the Timeline from Zoho - {tl['error']}")
+                if dgn["returned"] and dgn["dated"] < dgn["returned"] and not (tl and tl["dated"]):
                     en = dgn["enrich"]
                     st.caption(
                         f"Fields in Zoho's search result: {', '.join(dgn['raw_keys']) or '(none)'}.  "
@@ -2650,7 +2782,7 @@ def render_assessment():
                         f"Only {dgn['dated']:,} of those {dgn['returned']:,} came back with a Created Time, so the rest "
                         "can't be placed in a time frame."
                     )
-            if any(d["returned"] and d["dated"] < d["returned"] for d in lead_diag):
+            if any(d["returned"] and d["dated"] == 0 for d in lead_diag):
                 st.caption("Technical details for troubleshooting:")
                 try:
                     probe_id = next((d["sample_id"] for d in lead_diag if d["sample_id"]), None)
