@@ -2153,6 +2153,28 @@ def _search_leads_for_source(source, since_iso, headers):
     raise RuntimeError(f"Zoho CRM API returned an error searching Leads ({last})")
 
 
+def _converted_ids_for_source(source, headers):
+    """Ids of this source's converted leads, from Zoho's own 'converted only' search - used when the lead records
+    themselves carry no converted flag. Returns (set of ids or None, what happened)."""
+    params = {"criteria": f"(Lead_Source:equals:{_crit_escape(source)})", "converted": "true", "per_page": 200}
+    ids, page = set(), 1
+    while True:
+        try:
+            resp = requests.get(f"{ZOHO_API_DOMAIN}/crm/v2/Leads/search", headers=headers, params={**params, "page": page}, timeout=30)
+        except Exception as err:
+            return None, f"could not reach Zoho: {err}"
+        if resp.status_code == 204:
+            break
+        if resp.status_code != 200:
+            return None, f"status {resp.status_code}: {resp.text[:200]}"
+        payload = resp.json()
+        ids.update(r.get("id") for r in payload.get("data", []) if r.get("id"))
+        if not payload.get("info", {}).get("more_records") or page >= 10:
+            break
+        page += 1
+    return ids, ""
+
+
 @st.cache_data(ttl=300)
 def load_leads_for_sources(sources, since_iso):
     """Leads for the chosen sources since `since_iso`. Returns (DataFrame, converted_known, how-they-were-found)."""
@@ -2166,17 +2188,23 @@ def load_leads_for_sources(sources, since_iso):
         timeline = None
         if found and not any(r.get("Created_Time") for r in found):
             found, timeline = date_leads_from_timeline(found, since_iso, headers)
+        conv_ids, conv_err = None, ""
+        if found and not any(("Converted__s" in r or "$converted" in r) for r in found):
+            conv_ids, conv_err = _converted_ids_for_source(source, headers)
+            if conv_ids is not None:
+                found = [{**r, "Converted__s": r.get("id") in conv_ids} for r in found]
         records.extend(found)
         stamps = [parse_appt(r.get("Created_Time")) for r in found]
         stamps = [t for t in stamps if pd.notna(t)]
         diag.append(
             {
                 "source": source, "how": how, "returned": len(found), "dated": len(stamps),
-                "raw_keys": raw_keys, "enrich": enrich, "timeline": timeline, "sample_id": (found[0].get("id") if found else None),
+                "raw_keys": raw_keys, "enrich": enrich, "timeline": timeline,
+                "conv_lookup": (None if (conv_ids is None and not conv_err) else {"count": len(conv_ids or ()), "error": conv_err}), "sample_id": (found[0].get("id") if found else None),
                 "newest": max(stamps) if stamps else None, "oldest": min(stamps) if stamps else None,
             }
         )
-    converted_known = any("Converted__s" in r or "$converted" in r for r in records)
+    converted_known = bool(records) and all(("Converted__s" in r or "$converted" in r) for r in records)
     rows = []
     for r in records:
         flag = r.get("Converted__s", r.get("$converted"))
@@ -2853,6 +2881,15 @@ def render_assessment():
                         st.warning(f"That's a lot of leads, so only the newest {TIMELINE_MAX_LEADS:,} were checked.")
                     if tl["error"] and not tl["dated"]:
                         st.warning(f"Couldn't read the Timeline from Zoho - {tl['error']}")
+                cl = dgn.get("conv_lookup")
+                if cl:
+                    if cl["error"]:
+                        st.warning(f"Couldn't work out which leads are converted - Zoho said: {cl['error']}")
+                    else:
+                        st.caption(
+                            "The lead records carry no 'converted' flag, so Zoho's converted-only search was used: "
+                            f"{cl['count']:,} converted lead(s) from this source (all time)."
+                        )
                 if dgn["returned"] and dgn["dated"] < dgn["returned"] and not (tl and tl["dated"]):
                     en = dgn["enrich"]
                     st.caption(
