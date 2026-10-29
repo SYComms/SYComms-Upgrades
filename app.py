@@ -895,6 +895,49 @@ st.sidebar.caption(
     "Data refreshes from Zoho CRM automatically every 60 seconds, or instantly "
     "with the button above."
 )
+# --- Zoho token helper: only appears when `show_token_helper = true` is added to the Streamlit secrets ---
+try:
+    _show_token_helper = bool(st.secrets.get("show_token_helper", False))
+except Exception:
+    _show_token_helper = False
+if _show_token_helper:
+    with st.sidebar.expander("Zoho token helper"):
+        st.caption(
+            "1) In the Zoho API Console (api-console.zoho.eu) open your Self Client, Generate Code with scopes "
+            "ZohoCRM.modules.ALL,ZohoCRM.settings.ALL,ZohoCRM.users.READ (10 minutes). "
+            "2) Paste the code below straight away - it works once. "
+            "3) Copy the refresh token it shows into the app's Secrets under [zoho]."
+        )
+        _grant = st.text_input("Grant code", key="zoho_grant_code", type="password")
+        if st.button("Get refresh token", key="zoho_get_rt", **FULL_WIDTH):
+            st.session_state.pop("zoho_new_rt", None)
+            try:
+                _creds = st.secrets["zoho"]
+                _resp = requests.post(
+                    ZOHO_ACCOUNTS_URL,
+                    data={
+                        "grant_type": "authorization_code",
+                        "client_id": _creds["client_id"],
+                        "client_secret": _creds["client_secret"],
+                        "code": _grant.strip(),
+                    },
+                    timeout=20,
+                )
+                _payload = _resp.json()
+                if _payload.get("refresh_token"):
+                    st.session_state["zoho_new_rt"] = (_payload["refresh_token"], _payload.get("scope", ""))
+                else:
+                    st.error(f"Zoho said: {_payload.get('error', _payload)}. Make a fresh code and try again straight away.")
+            except Exception as _err:
+                st.error(f"Couldn't reach Zoho: {_err}")
+        if st.session_state.get("zoho_new_rt"):
+            _rt, _scope = st.session_state["zoho_new_rt"]
+            st.success("Done - copy this into Secrets as refresh_token under [zoho], then save.")
+            st.code(_rt, language=None)
+            if _scope:
+                st.caption(f"Scopes granted: {_scope}")
+            st.caption("Afterwards remove show_token_helper from Secrets, so this box disappears.")
+
 st.sidebar.divider()
 if st.sidebar.button("Log out", **FULL_WIDTH):
     st.session_state["password_correct"] = False
