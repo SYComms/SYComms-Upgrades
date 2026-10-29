@@ -256,6 +256,10 @@ def zoho_deal_url(deal_id):
     return f"https://crm.zoho.eu/crm/org{ZOHO_ORG_ID}/tab/Potentials/{deal_id}"
 
 
+def zoho_lead_url(lead_id):
+    return f"https://crm.zoho.eu/crm/org{ZOHO_ORG_ID}/tab/Leads/{lead_id}"
+
+
 # Deals fields. Monthly_Lease_Spend / Total_Lease_Value / Monthly_Network_Spend
 # are the fields this org actually populates when closing a deal (confirmed
 # live against a real closed-won deal); Potential_Value / Services_Value sit
@@ -2720,9 +2724,20 @@ def render_assessment():
             st.dataframe(wview, hide_index=True, **DF_WIDTH,
                          column_config={"Open in Zoho": st.column_config.LinkColumn(display_text="Open ↗")})
 
-    lead_bins_total, lead_src_rows, lead_status_rows = None, [], []
+    lead_bins_total, lead_src_rows, lead_status_rows, lead_conv_rows = None, [], [], []
     if leads_now is not None:
         ldf = leads_now["df"]
+        if conv_known:
+            pdf_l = leads_prev["df"]
+            for src in lead_sel:
+                n_now = int((ldf["Source"] == src).sum())
+                c_now = int(ldf.loc[ldf["Source"] == src, "Converted"].sum())
+                n_prev = int((pdf_l["Source"] == src).sum())
+                c_prev = int(pdf_l.loc[pdf_l["Source"] == src, "Converted"].sum())
+                lead_conv_rows.append((
+                    src, n_now, c_now, (c_now / n_now * 100 if n_now else 0.0),
+                    n_prev, c_prev, (c_prev / n_prev * 100 if n_prev else 0.0),
+                ))
         lead_bins_total = bin_counts(ldf["Created Time"], start, end, tf)
         lead_src_rows = [(src, int((ldf["Source"] == src).sum())) for src in lead_sel]
         lead_status_rows = [(str(k), int(v)) for k, v in ldf["Status"].replace("", "(no status)").value_counts().items()]
@@ -2753,6 +2768,38 @@ def render_assessment():
                     st.dataframe(pd.DataFrame(lead_status_rows, columns=["Status", "Leads"]), hide_index=True, **DF_WIDTH)
                 else:
                     st.caption("No leads in this period.")
+
+            if conv_known:
+                st.caption("Conversion by source - this period compared with the previous one")
+                ctab = pd.DataFrame(
+                    lead_conv_rows,
+                    columns=["Lead source", "Leads", "Converted", "Conversion", "Prev leads", "Prev converted", "Prev conversion"],
+                )
+                if len(lead_sel) > 1:
+                    tot_n, tot_c = int(ctab["Leads"].sum()), int(ctab["Converted"].sum())
+                    tot_pn, tot_pc = int(ctab["Prev leads"].sum()), int(ctab["Prev converted"].sum())
+                    ctab.loc[len(ctab)] = [
+                        "All selected", tot_n, tot_c, tot_c / tot_n * 100 if tot_n else 0.0,
+                        tot_pn, tot_pc, tot_pc / tot_pn * 100 if tot_pn else 0.0,
+                    ]
+                st.dataframe(
+                    ctab, hide_index=True, **DF_WIDTH,
+                    column_config={
+                        "Conversion": st.column_config.ProgressColumn("Conversion", min_value=0, max_value=100, format="%.0f%%"),
+                        "Prev conversion": st.column_config.ProgressColumn("Prev conversion", min_value=0, max_value=100, format="%.0f%%"),
+                    },
+                )
+                conv_df = ldf[ldf["Converted"]].sort_values("Created Time", ascending=False)
+                st.caption(f"Converted leads from the selected sources ({len(conv_df)})")
+                if conv_df.empty:
+                    st.caption("None of the leads added in this period have converted yet.")
+                else:
+                    cview = conv_df[["Created Time", "Name", "Company", "Source", "Status", "Created By", "Lead ID"]].copy()
+                    cview["Created Time"] = cview["Created Time"].dt.strftime("%d/%m/%Y %H:%M")
+                    cview["Open in Zoho"] = cview["Lead ID"].apply(zoho_lead_url)
+                    cview = cview.drop(columns=["Lead ID"]).rename(columns={"Created Time": "Lead added"})
+                    st.dataframe(cview, hide_index=True, **DF_WIDTH,
+                                 column_config={"Open in Zoho": st.column_config.LinkColumn(display_text="Open ↗")})
 
     if leads_now is not None and lead_diag:
         with st.expander("How these leads were found"):
@@ -2810,7 +2857,7 @@ def render_assessment():
         "stage_rows": stage_rows, "created_rows": created_rows, "won_rows": won_rows,
         "n_created": n_created, "n_won": n_won, "won_value": won_value,
         "lead_tiles": lead_tiles, "lead_names": ", ".join(lead_sel), "lead_bins": lead_bins_total,
-        "lead_sources": lead_src_rows, "lead_status": lead_status_rows,
+        "lead_sources": lead_src_rows, "lead_status": lead_status_rows, "lead_conv": lead_conv_rows,
     }
 
 
@@ -3201,6 +3248,10 @@ if REPORTLAB_OK:
             ll = [Paragraph(f"LEADS ADDED  -  {_t(A['tf']).lower()}", st["lbl"]), Spacer(1, 1.5 * mm), lchart]
             lr = [Paragraph("BY LEAD SOURCE", st["lbl"]), Spacer(1, 1.5 * mm),
                   _BarList(hl, [(k, v) for k, v in A["lead_sources"][:5]], color="cyan", label_w=32 * mm, fmt=lambda v: f"{int(v)}")]
+            if A.get("lead_conv"):
+                lr += [Spacer(1, 2 * mm), Paragraph("CONVERTED BY SOURCE", st["lbl"]), Spacer(1, 1.5 * mm),
+                       _BarList(hl, [(f"{_clean(k)} ({pct:.0f}%)", c, "good") for k, n, c, pct, *_ in A["lead_conv"][:5]],
+                                color="good", label_w=32 * mm, fmt=lambda v: f"{int(v)}")]
             if A["lead_status"]:
                 lr += [Spacer(1, 2 * mm), Paragraph("BY LEAD STATUS", st["lbl"]), Spacer(1, 1.5 * mm),
                        _BarList(hl, [(k, v) for k, v in A["lead_status"][:4]], color="accent", label_w=32 * mm, fmt=lambda v: f"{int(v)}")]
