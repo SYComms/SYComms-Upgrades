@@ -896,8 +896,21 @@ st.sidebar.caption(
     "with the button above."
 )
 # --- Zoho token helper: only appears when `show_token_helper = true` is added to the Streamlit secrets ---
+def _secret_flag(*places):
+    """True when `show_token_helper` is switched on in Secrets - at the top level, or (if it ended up under the
+    [zoho] heading by mistake) in there. Accepts true / "true" / "yes" / 1."""
+    for place in places:
+        try:
+            value = place.get("show_token_helper") if place is not None else None
+        except Exception:
+            value = None
+        if value is not None and str(value).strip().lower() in ("true", "1", "yes", "on"):
+            return True
+    return False
+
+
 try:
-    _show_token_helper = bool(st.secrets.get("show_token_helper", False))
+    _show_token_helper = _secret_flag(st.secrets, st.secrets.get("zoho"))
 except Exception:
     _show_token_helper = False
 if _show_token_helper:
@@ -908,6 +921,27 @@ if _show_token_helper:
             "2) Paste the code below straight away - it works once. "
             "3) Copy the refresh token it shows into the app's Secrets under [zoho]."
         )
+        if st.button("Check what the current token can do", key="zoho_check_scopes", **FULL_WIDTH):
+            try:
+                _c = st.secrets["zoho"]
+                _r = requests.post(
+                    ZOHO_ACCOUNTS_URL,
+                    data={"grant_type": "refresh_token", "client_id": _c["client_id"],
+                          "client_secret": _c["client_secret"], "refresh_token": _c["refresh_token"]},
+                    timeout=20,
+                ).json()
+                if _r.get("access_token"):
+                    _granted = _r.get("scope", "")
+                    st.caption(f"This token's scopes: {_granted or '(Zoho did not list any)'}")
+                    _g = _granted.replace(" ", ",").split(",")
+                    _has = lambda *names: any(n in _g for n in names)
+                    st.write(("✅" if _has("ZohoCRM.modules.ALL", "ZohoCRM.modules.leads.READ", "ZohoCRM.modules.leads.ALL") else "❌") + " Can read Leads")
+                    st.write(("✅" if _has("ZohoCRM.users.READ", "ZohoCRM.users.ALL") else "❌") + " Can read the user list")
+                    st.write(("✅" if _has("ZohoCRM.settings.ALL", "ZohoCRM.settings.fields.READ") else "❌") + " Can read field settings")
+                else:
+                    st.error(f"Zoho refused the saved refresh token: {_r.get('error', _r)}")
+            except Exception as _err:
+                st.error(f"Couldn't check: {_err}")
         _grant = st.text_input("Grant code", key="zoho_grant_code", type="password")
         if st.button("Get refresh token", key="zoho_get_rt", **FULL_WIDTH):
             st.session_state.pop("zoho_new_rt", None)
