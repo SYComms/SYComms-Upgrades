@@ -2153,6 +2153,67 @@ def _search_leads_for_source(source, since_iso, headers):
     raise RuntimeError(f"Zoho CRM API returned an error searching Leads ({last})")
 
 
+CONV_KEYS = ("$converted_detail", "Converted_Detail", "converted_detail")
+
+
+def _conv_from_record(rec):
+    """What Zoho says a lead turned into (contact / account / deal), or None if the record carries no such block."""
+    for key in CONV_KEYS:
+        block = rec.get(key)
+        if isinstance(block, dict):
+            def part(name):
+                v = block.get(name) or block.get(name.capitalize()) or {}
+                return v if isinstance(v, dict) else {}
+            deal = part("deal")
+            return {
+                "deal_id": deal.get("id") or "", "deal_name": deal.get("name") or "",
+                "account": part("account").get("name") or "", "contact": part("contact").get("name") or "",
+                "when": block.get("converted_date_time") or rec.get("Converted_Date_Time") or "",
+            }
+    return None
+
+
+@st.cache_data(ttl=300)
+def get_lead_conversions(lead_ids):
+    """For each converted lead, what it was converted into. Returns ({lead id: detail or None}, diag)."""
+    from concurrent.futures import ThreadPoolExecutor
+    token = get_access_token()
+    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+    diag = {"error": "", "sample": "", "keys": ""}
+    paths = ["/crm/v2/Leads/{id}", "/crm/v2.1/Leads/{id}"]
+
+    def one(rid):
+        for path in paths:
+            for extra in ({}, {"converted": "both"}):
+                try:
+                    resp = requests.get(f"{ZOHO_API_DOMAIN}{path.format(id=rid)}", headers=headers, params=extra, timeout=30)
+                except Exception as err:
+                    if not diag["error"]:
+                        diag["error"] = f"could not reach Zoho: {err}"
+                    return None
+                if resp.status_code != 200:
+                    if not diag["error"]:
+                        diag["error"] = f"status {resp.status_code}: {resp.text[:200]}"
+                    continue
+                data = (resp.json().get("data") or [None])[0]
+                if not data:
+                    continue
+                if not diag["keys"]:
+                    diag["keys"] = ", ".join(sorted(k for k in data if re.search(r"conver|deal|contact|account", k, re.I)))
+                got = _conv_from_record(data)
+                if got and not diag["sample"]:
+                    diag["sample"] = str(got)
+                if got is not None:
+                    diag["error"] = ""
+                return got
+        return None
+
+    ids = list(lead_ids)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        out = dict(zip(ids, pool.map(one, ids)))
+    return out, diag
+
+
 def _converted_ids_for_source(source, headers):
     """Ids of this source's converted leads, from Zoho's own 'converted only' search - used when the lead records
     themselves carry no converted flag. Returns (set of ids or None, what happened)."""
@@ -2583,6 +2644,51 @@ def render_assessment():
         return {"df": l, "added": len(l), "converted": int(l["Converted"].sum()) if conv_known else None}
 
     leads_now, leads_prev = lead_stats(start, end), lead_stats(pstart, pend)
+
+    # Which converted leads actually became a deal, and did that deal win? Zoho's own conversion record is used
+    # where it exists; otherwise a deal for the same company created after the lead is the best match.
+    conv_links, conv_diag = [], {"error": "", "sample": "", "keys": ""}
+    if leads_now is not None and conv_known:
+        cdf = leads_now["df"][leads_now["df"]["Converted"]]
+        if len(cdf):
+            try:
+                conv_map, conv_diag = get_lead_conversions(tuple(cdf["Lead ID"]))
+            except Exception as err:
+                conv_map, conv_diag = {}, {"error": str(err), "sample": "", "keys": ""}
+            by_deal_id = deals_df.drop_duplicates("Deal ID").set_index("Deal ID") if len(deals_df) else None
+            for _, lr in cdf.iterrows():
+                det = conv_map.get(lr["Lead ID"])
+                deal, how = None, ""
+                if det and det["deal_id"] and by_deal_id is not None and det["deal_id"] in by_deal_id.index:
+                    deal, how = by_deal_id.loc[det["deal_id"]], "Zoho conversion record"
+                    deal = deal.copy(); deal["Deal ID"] = det["deal_id"]
+                elif det and det["deal_id"]:
+                    how = "Zoho says a deal was made, but it isn't in the deals feed"
+                elif det is not None:
+                    how = "No deal was made when converting"
+                if deal is None and not (det is not None and not det["deal_id"]) and len(deals_df) and lr["Company"]:
+                    m = deals_df[
+                        (deals_df["Account Name"].str.strip().str.lower() == lr["Company"].strip().lower())
+                        & (deals_df["Created Time"] >= (lr["Created Time"] - timedelta(days=1)))
+                    ].sort_values("Created Time")
+                    if len(m):
+                        deal, how = m.iloc[0], "Matched by company name"
+                conv_links.append({
+                    "lead": lr, "deal": deal, "how": how or "No deal found",
+                    "won": bool(deal is not None and stage_in(pd.Series([deal["Status"]]), STAGES_WON).iloc[0]),
+                })
+    n_conv_deal = sum(1 for c in conv_links if c["deal"] is not None)
+    n_conv_won = sum(1 for c in conv_links if c["won"])
+    conv_won_value = float(sum(c["deal"]["Total Lease Value"] for c in conv_links if c["won"]))
+    lead_tiles2 = None
+    if leads_now is not None and conv_known:
+        n_c = len(conv_links)
+        lead_tiles2 = [
+            ("Converted → became a deal", f"{n_conv_deal} of {n_c}", "", "a deal exists for them in Zoho" if n_c else "no converted leads", ""),
+            ("Converted → deal won", f"{n_conv_won} of {n_c}", "good", "deal stage is a won stage" if n_c else "", ""),
+            ("Won lease value", money(conv_won_value), "good", "from those won deals", ""),
+            ("Converted, no deal", f"{n_c - n_conv_deal}", "warn", "converted but no deal found", ""),
+        ]
     lead_tiles = None
     if leads_now is not None:
         lead_tiles = []
@@ -2652,6 +2758,11 @@ def render_assessment():
         if conv_known and leads_now["added"]:
             txt += f", **{leads_now['converted']}** converted ({leads_now['converted'] / leads_now['added'] * 100:.0f}%)"
         points.append(txt + ".")
+        if conv_known and conv_links:
+            points.append(
+                f"Of the **{len(conv_links)}** converted lead(s), **{n_conv_deal}** became a deal and **{n_conv_won}** of those "
+                f"deals are won ({money_short(conv_won_value)} lease value)."
+            )
         by_status = leads_now["df"]["Status"].replace("", "(no status)").value_counts()
         if len(by_status):
             points.append("Lead status: " + ", ".join(f"**{k}** {int(v)}" for k, v in by_status.head(6).items()) + ".")
@@ -2672,6 +2783,10 @@ def render_assessment():
             for col, (lab, val, t_, sub_, st_) in zip(st.columns(4), lead_tiles):
                 with col:
                     render_html(kpi_tile(lab, val, tone=t_, sub=sub_, sub_tone=st_))
+            if lead_tiles2:
+                for col, (lab, val, t_, sub_, st_) in zip(st.columns(4), lead_tiles2):
+                    with col:
+                        render_html(kpi_tile(lab, val, tone=t_, sub=sub_, sub_tone=st_))
         st.caption(
             f"Connected = answered with some talk time. A conversation is a connected call of {CONVERSATION_SECONDS} seconds or more."
         )
@@ -2800,6 +2915,8 @@ def render_assessment():
                 lead_conv_rows.append((
                     src, n_now, c_now, (c_now / n_now * 100 if n_now else 0.0),
                     n_prev, c_prev, (c_prev / n_prev * 100 if n_prev else 0.0),
+                    sum(1 for c in conv_links if c["lead"]["Source"] == src and c["deal"] is not None),
+                    sum(1 for c in conv_links if c["lead"]["Source"] == src and c["won"]),
                 ))
         lead_bins_total = bin_counts(ldf["Created Time"], start, end, tf)
         lead_src_rows = [(src, int((ldf["Source"] == src).sum())) for src in lead_sel]
@@ -2836,7 +2953,8 @@ def render_assessment():
                 st.caption("Conversion by source - this period compared with the previous one")
                 ctab = pd.DataFrame(
                     lead_conv_rows,
-                    columns=["Lead source", "Leads", "Converted", "Conversion", "Prev leads", "Prev converted", "Prev conversion"],
+                    columns=["Lead source", "Leads", "Converted", "Conversion", "Prev leads", "Prev converted", "Prev conversion",
+                             "Became deal", "Deal won"],
                 )
                 if len(lead_sel) > 1:
                     tot_n, tot_c = int(ctab["Leads"].sum()), int(ctab["Converted"].sum())
@@ -2844,6 +2962,7 @@ def render_assessment():
                     ctab.loc[len(ctab)] = [
                         "All selected", tot_n, tot_c, tot_c / tot_n * 100 if tot_n else 0.0,
                         tot_pn, tot_pc, tot_pc / tot_pn * 100 if tot_pn else 0.0,
+                        int(ctab["Became deal"].sum()), int(ctab["Deal won"].sum()),
                     ]
                 st.dataframe(
                     ctab, hide_index=True, **DF_WIDTH,
@@ -2852,17 +2971,46 @@ def render_assessment():
                         "Prev conversion": st.column_config.ProgressColumn("Prev conversion", min_value=0, max_value=100, format="%.0f%%"),
                     },
                 )
-                conv_df = ldf[ldf["Converted"]].sort_values("Created Time", ascending=False)
-                st.caption(f"Converted leads from the selected sources ({len(conv_df)})")
-                if conv_df.empty:
+                st.caption(f"Converted leads from the selected sources ({len(conv_links)}) - and what each became")
+                if not conv_links:
                     st.caption("None of the leads added in this period have converted yet.")
                 else:
-                    cview = conv_df[["Created Time", "Name", "Company", "Source", "Status", "Created By", "Lead ID"]].copy()
-                    cview["Created Time"] = cview["Created Time"].dt.strftime("%d/%m/%Y %H:%M")
-                    cview["Open in Zoho"] = cview["Lead ID"].apply(zoho_lead_url)
-                    cview = cview.drop(columns=["Lead ID"]).rename(columns={"Created Time": "Lead added"})
-                    st.dataframe(cview, hide_index=True, **DF_WIDTH,
-                                 column_config={"Open in Zoho": st.column_config.LinkColumn(display_text="Open ↗")})
+                    choice = st.selectbox(
+                        "Show", ["All converted leads", "Became a deal", "Deal won", "Converted but no deal found"],
+                        key="asm_convfilter",
+                    )
+                    keep = {
+                        "All converted leads": lambda c: True,
+                        "Became a deal": lambda c: c["deal"] is not None,
+                        "Deal won": lambda c: c["won"],
+                        "Converted but no deal found": lambda c: c["deal"] is None,
+                    }[choice]
+                    rows_c = []
+                    for c in sorted(conv_links, key=lambda c: c["lead"]["Created Time"], reverse=True):
+                        if not keep(c):
+                            continue
+                        lr, dl = c["lead"], c["deal"]
+                        rows_c.append({
+                            "Lead added": lr["Created Time"].strftime("%d/%m/%Y %H:%M"),
+                            "Lead": lr["Name"], "Company": lr["Company"], "Source": lr["Source"], "Lead status": lr["Status"],
+                            "Deal": dl["Client Name"] if dl is not None else "-",
+                            "Deal stage": dl["Status"] if dl is not None else "-",
+                            "Won?": "Yes" if c["won"] else ("No" if dl is not None else "-"),
+                            "Closed": (fmt_date_uk(pd.to_datetime(dl["Closing Date"], errors="coerce"))
+                                       if c["won"] and str(dl["Closing Date"]) else "-"),
+                            "Lease value": money(dl["Total Lease Value"]) if c["won"] else "-",
+                            "Linked by": c["how"],
+                            "Open lead": zoho_lead_url(lr["Lead ID"]),
+                            "Open deal": zoho_deal_url(dl["Deal ID"]) if dl is not None else None,
+                        })
+                    st.dataframe(pd.DataFrame(rows_c), hide_index=True, **DF_WIDTH, column_config={
+                        "Open lead": st.column_config.LinkColumn(display_text="Open ↗"),
+                        "Open deal": st.column_config.LinkColumn(display_text="Open ↗"),
+                    })
+                    st.caption(
+                        "A lead counts as 'converted' when Zoho marks it so; it only counts as 'deal won' if the deal it "
+                        "turned into is at a won stage (Closed Won / Sold)."
+                    )
 
     if leads_now is not None and lead_diag:
         with st.expander("How these leads were found"):
@@ -2909,6 +3057,15 @@ def render_assessment():
                         st.code(line, language=None)
                 except Exception as err:
                     st.caption(f"Couldn't run the troubleshooting lookups: {err}")
+            if conv_links:
+                hows = pd.Series([c["how"] for c in conv_links]).value_counts()
+                st.write("**How converted leads were linked to deals:** " + ", ".join(f"{k} ({v})" for k, v in hows.items()) + ".")
+                if conv_diag.get("error"):
+                    st.warning(f"Zoho wouldn't show the conversion record for some leads - {conv_diag['error']}")
+                st.caption("Conversion fields on a converted lead (technical):")
+                st.code(conv_diag.get("keys") or "(none returned)", language=None)
+                if conv_diag.get("sample"):
+                    st.code(conv_diag["sample"], language=None)
             st.caption(
                 f"Only leads whose Created Time falls in {label} are counted above "
                 f"({leads_now['added']:,} of the {sum(d['returned'] for d in lead_diag):,} returned)."
@@ -2931,6 +3088,7 @@ def render_assessment():
         "lead_tiles": lead_tiles, "lead_names": ", ".join(lead_sel), "lead_bins": lead_bins_total,
         "lead_sources": lead_src_rows, "lead_status": lead_status_rows, "lead_conv": lead_conv_rows,
         "deal_sources": deal_src_rows,
+        "conv_funnel": None if not conv_links else (len(conv_links), n_conv_deal, n_conv_won, conv_won_value),
     }
 
 
