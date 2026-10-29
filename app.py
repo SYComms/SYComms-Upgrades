@@ -1918,6 +1918,49 @@ def _enrich_leads(records, headers):
     return [{**r, **by_id.get(r.get("id"), {})} for r in records], info
 
 
+@st.cache_data(ttl=300)
+def probe_lead_dates(sample_id):
+    """Troubleshooting: ask Zoho three different ways where a lead's created date lives. Returns plain-text lines."""
+    token = get_access_token()
+    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+    lines = []
+
+    def call(path, params=None):
+        try:
+            resp = requests.get(f"{ZOHO_API_DOMAIN}/crm/v2/{path}", headers=headers, params=params or {}, timeout=30)
+            return resp.status_code, (resp.json() if resp.status_code == 200 else resp.text[:300])
+        except Exception as err:
+            return 0, str(err)
+
+    code, body = call("settings/fields", {"module": "Leads"})
+    if code == 200:
+        found = [
+            f"{f.get('api_name')} ({f.get('field_label')}, {f.get('data_type')})"
+            for f in body.get("fields", [])
+            if re.search(r"creat|time|date", f"{f.get('api_name')} {f.get('field_label')}", re.I)
+        ]
+        lines.append("Date/time fields on your Leads module: " + (", ".join(found) or "none found"))
+    else:
+        lines.append(f"Couldn't read the Leads field list (status {code}: {body})")
+
+    if sample_id:
+        code, body = call(f"Leads/{sample_id}")
+        if code == 200 and body.get("data"):
+            rec = body["data"][0]
+            shown = {k: rec[k] for k in rec if re.search(r"creat|time|date|modif", k, re.I)}
+            lines.append(f"One whole lead record from Zoho - its date/time fields: {shown or 'none present'}")
+        else:
+            lines.append(f"Fetching a single lead failed (status {code}: {body})")
+
+    code, body = call("Leads", {"fields": "Created_Time,Created_By,Lead_Source", "sort_by": "Created_Time",
+                                "sort_order": "desc", "per_page": 3})
+    if code == 200:
+        lines.append(f"Three newest leads in the whole Leads module: {body.get('data')}")
+    else:
+        lines.append(f"Listing the newest leads failed (status {code}: {body})")
+    return lines
+
+
 def _crit_escape(value):
     """Zoho search criteria treat ( ) , and backslash as special - escape them in a value."""
     return re.sub(r"([\\(),])", r"\\\1", value)
@@ -1995,7 +2038,7 @@ def load_leads_for_sources(sources, since_iso):
         diag.append(
             {
                 "source": source, "how": how, "returned": len(found), "dated": len(stamps),
-                "raw_keys": raw_keys, "enrich": enrich,
+                "raw_keys": raw_keys, "enrich": enrich, "sample_id": (found[0].get("id") if found else None),
                 "newest": max(stamps) if stamps else None, "oldest": min(stamps) if stamps else None,
             }
         )
@@ -2607,6 +2650,14 @@ def render_assessment():
                         f"Only {dgn['dated']:,} of those {dgn['returned']:,} came back with a Created Time, so the rest "
                         "can't be placed in a time frame."
                     )
+            if any(d["returned"] and d["dated"] < d["returned"] for d in lead_diag):
+                st.caption("Technical details for troubleshooting:")
+                try:
+                    probe_id = next((d["sample_id"] for d in lead_diag if d["sample_id"]), None)
+                    for line in probe_lead_dates(probe_id):
+                        st.code(line, language=None)
+                except Exception as err:
+                    st.caption(f"Couldn't run the troubleshooting lookups: {err}")
             st.caption(
                 f"Only leads whose Created Time falls in {label} are counted above "
                 f"({leads_now['added']:,} of the {sum(d['returned'] for d in lead_diag):,} returned)."
