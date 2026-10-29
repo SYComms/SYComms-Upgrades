@@ -1849,30 +1849,96 @@ def get_zoho_users():
 
 
 # ---- Zoho leads (the telemarketers' own leads, identified by Lead Source) ----
-LEAD_FIELDS_FULL = "Last_Name,First_Name,Company,Lead_Source,Lead_Status,Created_Time,Created_By,Converted__s"
-LEAD_FIELDS_SAFE = "Last_Name,First_Name,Company,Lead_Source,Lead_Status,Created_Time,Created_By"
+# A big org can have tens of thousands of leads, so nothing here downloads them all: the picker's choices come
+# from the Lead Source field's own list of options (one quick call), and leads are then fetched with Zoho's search
+# - only for the chosen source(s), and only back to the start of the comparison period.
+LEAD_COLUMNS = ["Lead ID", "Name", "Company", "Source", "Status", "Created Time", "Created By", "Converted"]
+
+
+@st.cache_data(ttl=3600)
+def get_lead_source_options():
+    """Lead Source choices as defined on the Leads module (falls back to the sources on the newest leads)."""
+    token = get_access_token()
+    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+    names = []
+    try:
+        resp = requests.get(
+            f"{ZOHO_API_DOMAIN}/crm/v2/settings/fields", headers=headers, params={"module": "Leads"}, timeout=20
+        )
+        if resp.status_code == 200:
+            for fld in resp.json().get("fields", []):
+                if fld.get("api_name") == "Lead_Source":
+                    names = [
+                        (v.get("display_value") or v.get("actual_value") or "").strip()
+                        for v in fld.get("pick_list_values", [])
+                    ]
+    except Exception:
+        names = []
+    names = [n for n in names if n and n != "-None-"]
+    if not names:  # no access to field settings: use the sources found on the newest leads instead
+        resp = requests.get(
+            f"{ZOHO_API_DOMAIN}/crm/v2/Leads", headers=headers, timeout=30,
+            params={"fields": "Lead_Source", "sort_by": "Created_Time", "sort_order": "desc", "per_page": 200},
+        )
+        if resp.status_code == 200:
+            names = sorted({(r.get("Lead_Source") or "").strip() for r in resp.json().get("data", [])} - {""})
+        elif resp.status_code != 204:
+            raise RuntimeError(f"Zoho CRM API returned an error fetching Leads (status {resp.status_code}): {resp.text}")
+    return sorted(dict.fromkeys(names), key=str.lower)
+
+
+def _crit_escape(value):
+    """Zoho search criteria treat ( ) , and backslash as special - escape them in a value."""
+    return re.sub(r"([\\(),])", r"\\\1", value)
+
+
+def _search_leads_for_source(source, since_iso, headers):
+    """All leads with this exact Lead Source created on/after `since_iso`, converted ones included.
+
+    Steps down through simpler requests if this Zoho org rejects part of one, so a quirk costs us the 'converted'
+    numbers or the date narrowing rather than the whole section."""
+    src = f"(Lead_Source:equals:{_crit_escape(source)})"
+    timed = f"({src}and(Created_Time:greater_equal:{since_iso}))"
+    variants = [
+        {"criteria": timed, "converted": "both"},
+        {"criteria": timed},
+        {"criteria": src, "converted": "both"},
+        {"criteria": src},
+    ]
+    last = None
+    for params in variants:
+        records, page, ok = [], 1, True
+        while True:
+            try:
+                resp = requests.get(
+                    f"{ZOHO_API_DOMAIN}/crm/v2/Leads/search", headers=headers,
+                    params={**params, "per_page": 200, "page": page}, timeout=30,
+                )
+            except Exception as err:
+                raise RuntimeError(f"Could not reach Zoho CRM API for Leads. Details: {err}")
+            if resp.status_code == 204:
+                break
+            if resp.status_code != 200:
+                last, ok = f"status {resp.status_code}: {resp.text}", False
+                break
+            payload = resp.json()
+            records.extend(payload.get("data", []))
+            if not payload.get("info", {}).get("more_records") or page >= 10:  # Zoho search caps at 2,000 records
+                break
+            page += 1
+        if ok:
+            return records
+    raise RuntimeError(f"Zoho CRM API returned an error searching Leads ({last})")
 
 
 @st.cache_data(ttl=300)
-def load_leads():
-    """Every lead, converted ones included (Zoho hides converted leads unless asked). Returns (DataFrame, converted_known).
-
-    Tries the richest request first and steps down if this Zoho org rejects a field, so a naming difference
-    costs us the 'converted' numbers rather than the whole section."""
-    attempts = [
-        {"fields": LEAD_FIELDS_FULL, "converted": "both"},
-        {"fields": LEAD_FIELDS_SAFE, "converted": "both"},
-        {"fields": LEAD_FIELDS_SAFE},
-    ]
-    records, last_err = None, None
-    for params in attempts:
-        try:
-            records = _paged_get("Leads", {**params, "sort_by": "Created_Time", "sort_order": "desc"}, "Leads")
-            break
-        except RuntimeError as err:
-            last_err = err
-    if records is None:
-        raise last_err
+def load_leads_for_sources(sources, since_iso):
+    """Leads for the chosen sources since `since_iso`. Returns (DataFrame, converted_known)."""
+    token = get_access_token()
+    headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+    records = []
+    for source in sources:
+        records.extend(_search_leads_for_source(source, since_iso, headers))
     converted_known = any("Converted__s" in r or "$converted" in r for r in records)
     rows = []
     for r in records:
@@ -1889,9 +1955,7 @@ def load_leads():
                 "Converted": bool(flag) if flag is not None else False,
             }
         )
-    df = pd.DataFrame(
-        rows, columns=["Lead ID", "Name", "Company", "Source", "Status", "Created Time", "Created By", "Converted"]
-    )
+    df = pd.DataFrame(rows, columns=LEAD_COLUMNS).drop_duplicates(subset=["Lead ID"])
     df["Created Time"] = pd.to_datetime(df["Created Time"], errors="coerce")
     df["Converted"] = df["Converted"].astype(bool)
     return df, converted_known
@@ -2150,27 +2214,35 @@ def render_assessment():
             "For telemarketers who add their own leads in Zoho - pick the lead source(s) to measure, or leave blank to skip.",
         )
         try:
-            leads_df, conv_known = load_leads()
+            source_options = get_lead_source_options()
         except Exception as err:
-            leads_err = str(err)
+            source_options, leads_err = [], str(err)
+        if not leads_err:
+            first_tok = (_norm_name(person).split() or [""])[0]
+            hinted = [x for x in source_options if first_tok and _norm_name(x).startswith(first_tok[:3])]
+            lead_sel = st.multiselect(
+                f"Lead sources to measure for {person}",
+                options=sorted(source_options, key=lambda x: (x not in hinted, x.lower())),
+                key=f"asm_leadsrc_{_norm_name(person)}", placeholder="Leave blank to skip leads",
+                help="The Lead Source choices set up in Zoho. Pick several to add them together.",
+            )
+            if hinted and not lead_sel:
+                st.caption("Possible matches for this name: " + ", ".join(hinted[:6]))
+            if not source_options:
+                st.caption("No lead sources were found in Zoho.")
+            if lead_sel:
+                try:
+                    with st.spinner("Fetching leads from Zoho..."):
+                        leads_df, conv_known = load_leads_for_sources(
+                            tuple(sorted(lead_sel)), (datetime.combine(pstart, datetime.min.time()) - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00+00:00"),
+                        )
+                except Exception as err:
+                    leads_err, lead_sel = str(err), []
         if leads_err:
             st.warning(
                 "Couldn't read the Leads from Zoho, so lead numbers are skipped for now. If this says the token "
                 f"isn't allowed, it needs the ZohoCRM.modules.leads.READ scope. Details: {leads_err}"
             )
-        else:
-            src_counts = leads_df[leads_df["Source"] != ""].groupby("Source").size().sort_values(ascending=False)
-            first_tok = (_norm_name(person).split() or [""])[0]
-            hinted = [x for x in src_counts.index if first_tok and _norm_name(x).startswith(first_tok[:3])]
-            lead_sel = st.multiselect(
-                f"Lead sources to measure for {person}",
-                options=sorted(src_counts.index, key=lambda x: (x not in hinted, x.lower())),
-                format_func=lambda x: f"{x} ({int(src_counts[x]):,} leads)",
-                key=f"asm_leadsrc_{_norm_name(person)}", placeholder="Leave blank to skip leads",
-                help="Every lead source found in Zoho's Leads. Pick several to add them together.",
-            )
-            if hinted and not lead_sel:
-                st.caption("Possible matches for this name: " + ", ".join(hinted[:6]))
 
     pkey = _norm_name(person)
     mine = deals_df[deals_df["Created By"].map(_norm_name) == pkey]
