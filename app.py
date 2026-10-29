@@ -264,11 +264,12 @@ def zoho_lead_url(lead_id):
 # are the fields this org actually populates when closing a deal (confirmed
 # live against a real closed-won deal); Potential_Value / Services_Value sit
 # empty, so they're only used as a fallback.
-DEAL_FIELDS = (
+DEAL_FIELDS_BASE = (
     "Deal_Name,Owner,Account_Name,Appt_Date_Time,Potential_Value,Services_Value,"
     "Monthly_Lease_Spend,Total_Lease_Value,Monthly_Network_Spend,Stage,Closing_Date,"
     "Created_By,Created_Time"
 )
+DEAL_FIELDS = DEAL_FIELDS_BASE + ",Lead_Source"  # Lead_Source is Zoho's standard Deals field
 CLOSED_WON_STAGE = "Closed Won"
 SOLD_DEALS_WINDOW_DAYS = 30
 
@@ -672,11 +673,18 @@ def load_deals():
     """Every deal, once, from the Deals module. The Sales Pipeline cards use
     the SYComms-owned slice of it; the Sold Deals card uses the Closed Won
     slice."""
-    records = _paged_get(
-        "Deals",
-        {"fields": DEAL_FIELDS, "sort_by": "Modified_Time", "sort_order": "desc"},
-        "Deals",
-    )
+    try:
+        records = _paged_get(
+            "Deals",
+            {"fields": DEAL_FIELDS, "sort_by": "Modified_Time", "sort_order": "desc"},
+            "Deals",
+        )
+    except Exception:  # e.g. this org has no Lead Source on Deals: carry on without it rather than lose every deal
+        records = _paged_get(
+            "Deals",
+            {"fields": DEAL_FIELDS_BASE, "sort_by": "Modified_Time", "sort_order": "desc"},
+            "Deals",
+        )
 
     rows = []
     for r in records:
@@ -700,6 +708,7 @@ def load_deals():
                 "Created By": (r.get("Created_By") or {}).get("name") or "",
                 "Created By Email": ((r.get("Created_By") or {}).get("email") or "").lower(),
                 "Created Time": parse_appt(r.get("Created_Time")),
+                "Lead Source": (r.get("Lead_Source") or "").strip(),
             }
         )
 
@@ -710,7 +719,7 @@ def load_deals():
                 "Deal ID", "Client Name", "Account Name", "Sales Rep", "Owner Email",
                 "Parsed Date", "Status", "Closing Date", "Monthly Lease Spend",
                 "Total Lease Value", "Monthly Network Spend",
-                "Created By", "Created By Email", "Created Time",
+                "Created By", "Created By Email", "Created Time", "Lead Source",
             ]
         )
     df["Parsed Date"] = pd.to_datetime(df["Parsed Date"], errors="coerce")
@@ -2690,19 +2699,45 @@ def render_assessment():
             else:
                 st.dataframe(stage_df, hide_index=True, **DF_WIDTH)
 
+        deal_src_rows, deal_src_table = [], None
+        if not created.empty:
+            src_series = created["Lead Source"].replace("", "(no lead source)")
+            won_flag = stage_in(created["Status"], STAGES_WON)
+            deal_src_table = (
+                pd.DataFrame({"Lead source": src_series, "Won": won_flag.astype(int)})
+                .groupby("Lead source").agg(Deals=("Won", "size"), Won=("Won", "sum")).reset_index()
+                .sort_values(["Deals", "Lead source"], ascending=[False, True])
+            )
+            deal_src_table["Won %"] = deal_src_table["Won"] / deal_src_table["Deals"] * 100
+            deal_src_rows = [(r["Lead source"], int(r["Deals"]), int(r["Won"])) for _, r in deal_src_table.iterrows()]
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                st.caption("Where this period's deals came from (lead source on the deal)")
+                render_leaderboard(deal_src_table.set_index("Lead source")["Deals"], "Lead source", "Deals created")
+            with sc2:
+                st.caption("Lead source vs outcome")
+                st.dataframe(
+                    deal_src_table, hide_index=True, **DF_WIDTH,
+                    column_config={"Won %": st.column_config.ProgressColumn("Won %", min_value=0, max_value=100, format="%.0f%%")},
+                )
+            if not (created["Lead Source"] != "").any():
+                st.caption("None of these deals has a Lead Source filled in on the deal in Zoho yet.")
+
         st.caption(f"Deals created ({n_created})")
         created_rows = []
         if created_sorted.empty:
             st.caption("None in this period.")
         else:
-            view = created_sorted[["Created Time", "Client Name", "Account Name", "Sales Rep", "Status", "Parsed Date", "Deal ID"]].copy()
+            view = created_sorted[["Created Time", "Client Name", "Account Name", "Sales Rep", "Status", "Lead Source", "Parsed Date", "Deal ID"]].copy()
+            view["Lead Source"] = view["Lead Source"].replace("", "-")
             view["Created Time"] = view["Created Time"].dt.strftime("%d/%m/%Y %H:%M")
             view["Appointment"] = view["Parsed Date"].apply(lambda d: d.strftime("%d/%m/%Y %H:%M") if pd.notna(d) else "-")
             view["Open in Zoho"] = view["Deal ID"].apply(zoho_deal_url)
             view = view.drop(columns=["Parsed Date", "Deal ID"]).rename(
-                columns={"Created Time": "Created", "Client Name": "Deal", "Sales Rep": "Booked for", "Status": "Stage"}
+                columns={"Created Time": "Created", "Client Name": "Deal", "Sales Rep": "Booked for", "Status": "Stage",
+                         "Lead Source": "Lead source"}
             )
-            created_rows = view.drop(columns=["Open in Zoho"]).values.tolist()
+            created_rows = view.drop(columns=["Open in Zoho"]).values.tolist()  # Created, Deal, Account, Booked for, Stage, Lead source, Appointment
             st.dataframe(view, hide_index=True, **DF_WIDTH,
                          column_config={"Open in Zoho": st.column_config.LinkColumn(display_text="Open ↗")})
 
@@ -2858,6 +2893,7 @@ def render_assessment():
         "n_created": n_created, "n_won": n_won, "won_value": won_value,
         "lead_tiles": lead_tiles, "lead_names": ", ".join(lead_sel), "lead_bins": lead_bins_total,
         "lead_sources": lead_src_rows, "lead_status": lead_status_rows, "lead_conv": lead_conv_rows,
+        "deal_sources": deal_src_rows,
     }
 
 
@@ -3267,12 +3303,23 @@ if REPORTLAB_OK:
             pair2, _ = _pair(lb, rb, W)
             story += [pair2, Spacer(1, 4 * mm)]
 
+        if A.get("deal_sources"):
+            hs = (W - 6 * mm) / 2
+            ds_l = [Paragraph("DEALS BY LEAD SOURCE", st["lbl"]), Spacer(1, 1.5 * mm),
+                    _BarList(hs, [(_clean(k), n) for k, n, w in A["deal_sources"][:5]], color="accent", label_w=32 * mm,
+                             fmt=lambda v: f"{int(v)}")]
+            ds_r = [Paragraph("CLOSED WON BY LEAD SOURCE", st["lbl"]), Spacer(1, 1.5 * mm),
+                    _BarList(hs, [(f"{_clean(k)} ({(w / n * 100 if n else 0):.0f}%)", w, "good") for k, n, w in A["deal_sources"][:5]],
+                             color="good", label_w=34 * mm, fmt=lambda v: f"{int(v)}")]
+            pair_ds, _ = _pair(ds_l, ds_r, W)
+            story += [pair_ds, Spacer(1, 4 * mm)]
+
         if A["created_rows"]:
             story.append(CondPageBreak(50 * mm))
             story += [Paragraph(f"DEALS CREATED  -  {A['n_created']} in the period", st["lbl"]), Spacer(1, 1.5 * mm)]
-            rows = [[r[0], {"t": r[1], "bold": True}, r[2], r[3], r[4], r[5]] for r in A["created_rows"][:6]]
-            story.append(_table(st, ["Created", "Deal", "Account", "Booked for", "Stage", "Appointment"], rows,
-                                [26 * mm, 40 * mm, 34 * mm, 30 * mm, 24 * mm, 28 * mm]))
+            rows = [[r[0], {"t": r[1], "bold": True}, r[2], r[3], r[4], r[5], r[6]] for r in A["created_rows"][:6]]
+            story.append(_table(st, ["Created", "Deal", "Account", "Booked for", "Stage", "Lead source", "Appointment"], rows,
+                                [23 * mm, 33 * mm, 28 * mm, 24 * mm, 22 * mm, 26 * mm, 26 * mm]))
             if len(A["created_rows"]) > 6:
                 story += [Spacer(1, 1 * mm), Paragraph(f"Showing the latest 6 of {len(A['created_rows'])} - the full list is in the app.", st["note"])]
             story.append(Spacer(1, 3 * mm))
