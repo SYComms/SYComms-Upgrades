@@ -1771,6 +1771,55 @@ def get_zoho_users():
         return [], str(err)
 
 
+# ---- Zoho leads (the telemarketers' own leads, identified by Lead Source) ----
+LEAD_FIELDS_FULL = "Last_Name,First_Name,Company,Lead_Source,Lead_Status,Created_Time,Created_By,Converted__s"
+LEAD_FIELDS_SAFE = "Last_Name,First_Name,Company,Lead_Source,Lead_Status,Created_Time,Created_By"
+
+
+@st.cache_data(ttl=300)
+def load_leads():
+    """Every lead, converted ones included (Zoho hides converted leads unless asked). Returns (DataFrame, converted_known).
+
+    Tries the richest request first and steps down if this Zoho org rejects a field, so a naming difference
+    costs us the 'converted' numbers rather than the whole section."""
+    attempts = [
+        {"fields": LEAD_FIELDS_FULL, "converted": "both"},
+        {"fields": LEAD_FIELDS_SAFE, "converted": "both"},
+        {"fields": LEAD_FIELDS_SAFE},
+    ]
+    records, last_err = None, None
+    for params in attempts:
+        try:
+            records = _paged_get("Leads", {**params, "sort_by": "Created_Time", "sort_order": "desc"}, "Leads")
+            break
+        except RuntimeError as err:
+            last_err = err
+    if records is None:
+        raise last_err
+    converted_known = any("Converted__s" in r or "$converted" in r for r in records)
+    rows = []
+    for r in records:
+        flag = r.get("Converted__s", r.get("$converted"))
+        rows.append(
+            {
+                "Lead ID": r.get("id"),
+                "Name": " ".join(x for x in [r.get("First_Name"), r.get("Last_Name")] if x),
+                "Company": r.get("Company") or "",
+                "Source": (r.get("Lead_Source") or "").strip(),
+                "Status": r.get("Lead_Status") or "",
+                "Created Time": parse_appt(r.get("Created_Time")),
+                "Created By": (r.get("Created_By") or {}).get("name") or "",
+                "Converted": bool(flag) if flag is not None else False,
+            }
+        )
+    df = pd.DataFrame(
+        rows, columns=["Lead ID", "Name", "Company", "Source", "Status", "Created Time", "Created By", "Converted"]
+    )
+    df["Created Time"] = pd.to_datetime(df["Created Time"], errors="coerce")
+    df["Converted"] = df["Converted"].astype(bool)
+    return df, converted_known
+
+
 # ---- time frames ----
 def period_bounds(kind, ref):
     if kind == "Week":
@@ -1865,6 +1914,7 @@ def render_bins_chart(rows, height=190):
     chart_df["Order"] = chart_df.groupby("Series").cumcount()
     names = list(dict.fromkeys(chart_df["Series"]))
     palette = {"Deals created": "#7C83FF", "Connected": "#34D399", "Not connected": "#5E6A82"}
+    spare = ["#7C83FF", "#38D6F5", "#34D399", "#FBBF24", "#FB923C", "#F472B6", "#A78BFA"]
     chart = (
         alt.Chart(chart_df)
         .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
@@ -1873,7 +1923,7 @@ def render_bins_chart(rows, height=190):
             y=alt.Y("Count:Q", title="", axis=alt.Axis(tickMinStep=1)),
             color=alt.Color(
                 "Series:N",
-                scale=alt.Scale(domain=names, range=[palette.get(n, "#7C83FF") for n in names]),
+                scale=alt.Scale(domain=names, range=[palette.get(n, spare[i % len(spare)]) for i, n in enumerate(names)]),
                 legend=alt.Legend(orient="top", title=None, labelColor="#8C98B0") if len(names) > 1 else None,
             ),
             tooltip=["Bin", "Series", "Count"],
@@ -2015,6 +2065,36 @@ def render_assessment():
             )
         return
 
+    # ------------------------------------------------------------------ 3. lead sources (optional)
+    lead_sel, leads_df, leads_err, conv_known = [], None, None, False
+    with st.container(key="card-asm-leadpick"):
+        section_header(
+            3, "Lead sources (optional)",
+            "For telemarketers who add their own leads in Zoho - pick the lead source(s) to measure, or leave blank to skip.",
+        )
+        try:
+            leads_df, conv_known = load_leads()
+        except Exception as err:
+            leads_err = str(err)
+        if leads_err:
+            st.warning(
+                "Couldn't read the Leads from Zoho, so lead numbers are skipped for now. If this says the token "
+                f"isn't allowed, it needs the ZohoCRM.modules.leads.READ scope. Details: {leads_err}"
+            )
+        else:
+            src_counts = leads_df[leads_df["Source"] != ""].groupby("Source").size().sort_values(ascending=False)
+            first_tok = (_norm_name(person).split() or [""])[0]
+            hinted = [x for x in src_counts.index if first_tok and _norm_name(x).startswith(first_tok[:3])]
+            lead_sel = st.multiselect(
+                f"Lead sources to measure for {person}",
+                options=sorted(src_counts.index, key=lambda x: (x not in hinted, x.lower())),
+                format_func=lambda x: f"{x} ({int(src_counts[x]):,} leads)",
+                key=f"asm_leadsrc_{_norm_name(person)}", placeholder="Leave blank to skip leads",
+                help="Every lead source found in Zoho's Leads. Pick several to add them together.",
+            )
+            if hinted and not lead_sel:
+                st.caption("Possible matches for this name: " + ", ".join(hinted[:6]))
+
     pkey = _norm_name(person)
     mine = deals_df[deals_df["Created By"].map(_norm_name) == pkey]
 
@@ -2081,6 +2161,39 @@ def render_assessment():
         sub, tone = delta_sub(calls["talk"], pc["talk"], fmt=fmt_talk)
         call_tiles.append(("Talk time", fmt_talk(calls["talk"]), "warn", sub, tone))
 
+    # ---- leads
+    def lead_stats(a, b):
+        if not lead_sel or leads_df is None:
+            return None
+        l = leads_df[leads_df["Source"].isin(lead_sel) & _between(leads_df["Created Time"], a, b)]
+        return {"df": l, "added": len(l), "converted": int(l["Converted"].sum()) if conv_known else None}
+
+    leads_now, leads_prev = lead_stats(start, end), lead_stats(pstart, pend)
+    lead_tiles = None
+    if leads_now is not None:
+        lead_tiles = []
+        sub, tone = delta_sub(leads_now["added"], leads_prev["added"])
+        lead_tiles.append(("Leads added", f"{leads_now['added']:,}", "", sub, tone))
+        if conv_known:
+            sub, tone = delta_sub(leads_now["converted"], leads_prev["converted"])
+            lead_tiles.append(("Converted", f"{leads_now['converted']:,}", "good", sub, tone))
+            rate_l = leads_now["converted"] / leads_now["added"] * 100 if leads_now["added"] else 0.0
+            p_rate_l = leads_prev["converted"] / leads_prev["added"] * 100 if leads_prev["added"] else 0.0
+            dpl = round(rate_l) - round(p_rate_l)
+            lead_tiles.append((
+                "Conversion rate", f"{rate_l:.0f}%", "cyan",
+                f"same as previous ({p_rate_l:.0f}%)" if dpl == 0 else f"{'+' if dpl > 0 else '-'}{abs(dpl)} pts vs {p_rate_l:.0f}% previous",
+                "" if dpl == 0 else ("good" if dpl > 0 else "bad"),
+            ))
+        else:
+            lead_tiles.append(("Converted", "n/a", "good", "Zoho didn't return conversion data", ""))
+            lead_tiles.append(("Conversion rate", "n/a", "cyan", "", ""))
+        by_src = leads_now["df"]["Source"].value_counts()
+        lead_tiles.append((
+            "Busiest source", by_src.index[0] if len(by_src) else "-", "warn",
+            f"{int(by_src.iloc[0])} lead(s)" if len(by_src) else "no leads in period", "",
+        ))
+
     # ---- highlights
     points = []
     if n_created:
@@ -2106,7 +2219,7 @@ def render_assessment():
                 f"averaging **{fmt_talk(avg)}** per connected call."
             )
             if n_created and calls["connected"]:
-                points.append(f"That is roughly **{calls['connected'] / n_created:.0f}** connected calls per deal created.")
+                points.append(f"That is roughly **{calls['connected'] / n_created:.1f}** connected calls per deal created.")
         else:
             points.append(
                 "**No outbound calls** were found for the selected phone identity in this period - check the "
@@ -2118,9 +2231,17 @@ def render_assessment():
                 "so call numbers for this period may be understated."
             )
 
-    # ------------------------------------------------------------------ 3. scorecard
+    if leads_now is not None:
+        names_txt = ", ".join(lead_sel)
+        txt = (f"**{leads_now['added']:,}** lead(s) added from **{names_txt}** in {label} "
+               f"(previous: {leads_prev['added']:,})")
+        if conv_known and leads_now["added"]:
+            txt += f", **{leads_now['converted']}** converted ({leads_now['converted'] / leads_now['added'] * 100:.0f}%)"
+        points.append(txt + ".")
+
+    # ------------------------------------------------------------------ scorecard
     with st.container(key="card-asm-score"):
-        section_header(3, f"{person} - scorecard", f"{label}  ·  deals credited by Created By in Zoho")
+        section_header(4, f"{person} - scorecard", f"{label}  ·  deals credited by Created By in Zoho")
         render_html('<div class="pe-subhead"><span class="n">Deals</span></div>')
         for col, (lab, val, t_, sub_, st_) in zip(st.columns(4), deal_tiles):
             with col:
@@ -2129,6 +2250,11 @@ def render_assessment():
         for col, (lab, val, t_, sub_, st_) in zip(st.columns(4), call_tiles):
             with col:
                 render_html(kpi_tile(lab, val, tone=t_, sub=sub_, sub_tone=st_))
+        if lead_tiles is not None:
+            render_html(f'<div class="pe-subhead"><span class="n">Leads they added ({esc(", ".join(lead_sel))})</span></div>')
+            for col, (lab, val, t_, sub_, st_) in zip(st.columns(4), lead_tiles):
+                with col:
+                    render_html(kpi_tile(lab, val, tone=t_, sub=sub_, sub_tone=st_))
         st.caption(
             f"Connected = answered with some talk time. A conversation is a connected call of {CONVERSATION_SECONDS} seconds or more."
         )
@@ -2149,7 +2275,7 @@ def render_assessment():
         call_other_bins = [(lab, a - c) for (lab, a), (_, c) in zip(all_bins, call_conn_bins)]
     with st.container(key="card-asm-activity"):
         gran_word = {"D": "Per day", "W": "Per week", "M": "Per month"}[_bin_spec(tf)]
-        section_header(4, "Activity over time", f"{gran_word} across {label}.")
+        section_header(5, "Activity over time", f"{gran_word} across {label}.")
         ac1, ac2 = st.columns(2)
         with ac1:
             st.caption("Deals created")
@@ -2167,7 +2293,7 @@ def render_assessment():
     # ------------------------------------------------------------------ 5. deals
     created_sorted = created.sort_values("Created Time", ascending=False)
     with st.container(key="card-asm-deals"):
-        section_header(5, "Deals", f"Created by {person} in {label}, and the ones that closed won.")
+        section_header(6, "Deals", f"Created by {person} in {label}, and the ones that closed won.")
         dc1, dc2 = st.columns(2)
         with dc1:
             st.caption("Booked for (deal owner)")
@@ -2218,6 +2344,40 @@ def render_assessment():
             st.dataframe(wview, hide_index=True, **DF_WIDTH,
                          column_config={"Open in Zoho": st.column_config.LinkColumn(display_text="Open ↗")})
 
+    lead_bins_total, lead_src_rows, lead_status_rows = None, [], []
+    if leads_now is not None:
+        ldf = leads_now["df"]
+        lead_bins_total = bin_counts(ldf["Created Time"], start, end, tf)
+        lead_src_rows = [(src, int((ldf["Source"] == src).sum())) for src in lead_sel]
+        lead_status_rows = [(str(k), int(v)) for k, v in ldf["Status"].replace("", "(no status)").value_counts().items()]
+        with st.container(key="card-asm-leads"):
+            section_header(7, "Leads", f"Leads from {', '.join(lead_sel)}, added in {label}.")
+            lc1, lc2 = st.columns(2)
+            with lc1:
+                st.caption("Leads added")
+                if ldf.empty:
+                    st.caption("No leads from these sources in this period.")
+                else:
+                    chart_rows = []
+                    for src in lead_sel[:6]:
+                        chart_rows += [(lab, src, n) for lab, n in bin_counts(ldf["Created Time"], start, end, tf, mask=(ldf["Source"] == src))]
+                    if len(lead_sel) > 6:
+                        rest = ldf["Source"].isin(lead_sel[6:])
+                        chart_rows += [(lab, "Other sources", n) for lab, n in bin_counts(ldf["Created Time"], start, end, tf, mask=rest)]
+                    render_bins_chart(chart_rows)
+            with lc2:
+                st.caption("By lead source")
+                src_table = pd.DataFrame({"Lead source": lead_sel, "Leads": [n for _, n in lead_src_rows]})
+                if conv_known:
+                    conv_by = ldf.groupby("Source")["Converted"].sum().reindex(lead_sel).fillna(0).astype(int).values
+                    src_table["Converted"] = conv_by
+                st.dataframe(src_table, hide_index=True, **DF_WIDTH)
+                st.caption("By lead status")
+                if lead_status_rows:
+                    st.dataframe(pd.DataFrame(lead_status_rows, columns=["Status", "Leads"]), hide_index=True, **DF_WIDTH)
+                else:
+                    st.caption("No leads in this period.")
+
     stage_rows = [
         (str(r["Stage"]), int(r["Deals"]), STAGE_DOT_COLORS.get(str(r["Stage"]).lower(), "#7C83FF"))
         for _, r in (created["Status"].replace("", "(no stage)").value_counts().rename_axis("Stage").reset_index(name="Deals").iterrows())
@@ -2232,6 +2392,8 @@ def render_assessment():
         "booked_for": [(k, int(v)) for k, v in created["Sales Rep"].replace("", "Unassigned").value_counts().items()],
         "stage_rows": stage_rows, "created_rows": created_rows, "won_rows": won_rows,
         "n_created": n_created, "n_won": n_won, "won_value": won_value,
+        "lead_tiles": lead_tiles, "lead_names": ", ".join(lead_sel), "lead_bins": lead_bins_total,
+        "lead_sources": lead_src_rows, "lead_status": lead_status_rows,
     }
 
 
@@ -2589,6 +2751,9 @@ if REPORTLAB_OK:
                  _KpiRow(W, A["deal_tiles"]), Spacer(1, 3.5 * mm),
                  Paragraph("PHONE CALLS  -  outbound, from the Grandstream UCM call records", st["lbl"]), Spacer(1, 1.5 * mm),
                  _KpiRow(W, A["call_tiles"]), Spacer(1, 3.5 * mm)]
+        if A.get("lead_tiles"):
+            story += [Paragraph(f"LEADS THEY ADDED  -  lead source(s): {_t(A['lead_names'])}", st["lbl"]), Spacer(1, 1.5 * mm),
+                      _KpiRow(W, A["lead_tiles"]), Spacer(1, 3.5 * mm)]
         story.append(_callout(st, W, [md_bold(p, lambda t, b: _bold(t) if b else _t(t)) for p in A["points"]]))
         story.append(Spacer(1, 4 * mm))
 
@@ -2609,6 +2774,21 @@ if REPORTLAB_OK:
                      chart(A["call_bins"], "faint")]
         pair, _ = _pair(left, right, W)
         story += [pair, Spacer(1, 4 * mm)]
+
+        if A.get("lead_bins") is not None:
+            hl = (W - 6 * mm) / 2
+            nb = len(A["lead_bins"])
+            lchart = (_ColumnChart(hl, [(lab, v, "cyan", "") for lab, v in A["lead_bins"]], height=28 * mm,
+                                   label_every=max(1, -(-nb // 12)), show_values=nb <= 16)
+                      if any(v for _, v in A["lead_bins"]) else Paragraph("No leads from these sources in this period.", st["note"]))
+            ll = [Paragraph(f"LEADS ADDED  -  {_t(A['tf']).lower()}", st["lbl"]), Spacer(1, 1.5 * mm), lchart]
+            lr = [Paragraph("BY LEAD SOURCE", st["lbl"]), Spacer(1, 1.5 * mm),
+                  _BarList(hl, [(k, v) for k, v in A["lead_sources"][:5]], color="cyan", label_w=32 * mm, fmt=lambda v: f"{int(v)}")]
+            if A["lead_status"]:
+                lr += [Spacer(1, 2 * mm), Paragraph("BY LEAD STATUS", st["lbl"]), Spacer(1, 1.5 * mm),
+                       _BarList(hl, [(k, v) for k, v in A["lead_status"][:4]], color="accent", label_w=32 * mm, fmt=lambda v: f"{int(v)}")]
+            pairl, _ = _pair(ll, lr, W)
+            story += [pairl, Spacer(1, 4 * mm)]
 
         if A["booked_for"]:
             hh = (W - 6 * mm) / 2
