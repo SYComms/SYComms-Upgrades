@@ -1855,7 +1855,9 @@ def get_zoho_users():
             page += 1
         return [
             {"name": (u.get("full_name") or "").strip(), "email": (u.get("email") or "").lower()}
-            for u in users if (u.get("full_name") or "").strip()
+            for u in users
+            if (u.get("full_name") or "").strip()
+            and str(u.get("status") or "active").lower() not in ("inactive", "disabled", "deactivated", "deleted", "disabled_user")
         ], None
     except Exception as err:  # never let a nice-to-have lookup break the tab
         return [], str(err)
@@ -2419,7 +2421,9 @@ def render_assessment():
             return
 
         zoho_users, users_error = get_zoho_users()
-        created_names = sorted({n for n in deals_df["Created By"] if n})
+        # Only people who are still active in Zoho. People who merely appear as a deal's Created By may have left,
+        # so those names are used only as a fallback when the user list itself can't be read.
+        created_names = [] if zoho_users else sorted({n for n in deals_df["Created By"] if n})
         by_key = {}
         for name in [u["name"] for u in zoho_users] + created_names:
             by_key.setdefault(_norm_name(name), name)
@@ -2428,7 +2432,7 @@ def render_assessment():
         pc1, pc2 = st.columns([2, 1])
         person = pc1.selectbox(
             "Person", people, index=None, placeholder="Search for a person...", key="asm_person",
-            help="Everyone in Zoho. Type to search.",
+            help="Everyone who is currently active in Zoho. Type to search.",
         )
         tf = pc2.selectbox("Time frame", ASM_TIMEFRAMES, index=1, key="asm_tf")
         if users_error and not zoho_users:
