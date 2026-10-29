@@ -1894,19 +1894,23 @@ def _crit_escape(value):
 
 def _search_leads_for_source(source, since_iso, headers):
     """All leads with this exact Lead Source created on/after `since_iso`, converted ones included.
+    Returns (records, how) where `how` says which kind of request finally worked.
 
-    Steps down through simpler requests if this Zoho org rejects part of one, so a quirk costs us the 'converted'
-    numbers or the date narrowing rather than the whole section."""
+    Steps down through simpler requests if this Zoho org rejects part of one, and - because a date filter that
+    Zoho quietly misreads looks exactly like 'no leads' - if the date-narrowed search finds nothing it looks again
+    across all dates (the dates are then checked here instead)."""
     src = f"(Lead_Source:equals:{_crit_escape(source)})"
     timed = f"({src}and(Created_Time:greater_equal:{since_iso}))"
     variants = [
-        {"criteria": timed, "converted": "both"},
-        {"criteria": timed},
-        {"criteria": src, "converted": "both"},
-        {"criteria": src},
+        ("date-narrowed, converted included", {"criteria": timed, "converted": "both"}, True),
+        ("date-narrowed", {"criteria": timed}, True),
+        ("all dates, converted included", {"criteria": src, "converted": "both"}, False),
+        ("all dates", {"criteria": src}, False),
     ]
-    last = None
-    for params in variants:
+    last, timed_came_back_empty = None, False
+    for how, params, is_timed in variants:
+        if is_timed and timed_came_back_empty:
+            continue
         records, page, ok = [], 1, True
         while True:
             try:
@@ -1926,19 +1930,36 @@ def _search_leads_for_source(source, since_iso, headers):
             if not payload.get("info", {}).get("more_records") or page >= 10:  # Zoho search caps at 2,000 records
                 break
             page += 1
-        if ok:
-            return records
+        if not ok:
+            continue
+        if records:
+            return records, how
+        if is_timed:
+            timed_came_back_empty = True  # maybe really none - or the date filter was misread: look at all dates too
+            continue
+        return records, how + " (nothing found)"
+    if timed_came_back_empty:
+        return [], "date-narrowed (nothing found)"
     raise RuntimeError(f"Zoho CRM API returned an error searching Leads ({last})")
 
 
 @st.cache_data(ttl=300)
 def load_leads_for_sources(sources, since_iso):
-    """Leads for the chosen sources since `since_iso`. Returns (DataFrame, converted_known)."""
+    """Leads for the chosen sources since `since_iso`. Returns (DataFrame, converted_known, how-they-were-found)."""
     token = get_access_token()
     headers = {"Authorization": f"Zoho-oauthtoken {token}"}
-    records = []
+    records, diag = [], []
     for source in sources:
-        records.extend(_search_leads_for_source(source, since_iso, headers))
+        found, how = _search_leads_for_source(source, since_iso, headers)
+        records.extend(found)
+        stamps = [parse_appt(r.get("Created_Time")) for r in found]
+        stamps = [t for t in stamps if pd.notna(t)]
+        diag.append(
+            {
+                "source": source, "how": how, "returned": len(found),
+                "newest": max(stamps) if stamps else None, "oldest": min(stamps) if stamps else None,
+            }
+        )
     converted_known = any("Converted__s" in r or "$converted" in r for r in records)
     rows = []
     for r in records:
@@ -1958,7 +1979,7 @@ def load_leads_for_sources(sources, since_iso):
     df = pd.DataFrame(rows, columns=LEAD_COLUMNS).drop_duplicates(subset=["Lead ID"])
     df["Created Time"] = pd.to_datetime(df["Created Time"], errors="coerce")
     df["Converted"] = df["Converted"].astype(bool)
-    return df, converted_known
+    return df, converted_known, diag
 
 
 # ---- time frames ----
@@ -2207,7 +2228,7 @@ def render_assessment():
         return
 
     # ------------------------------------------------------------------ 3. lead sources (optional)
-    lead_sel, leads_df, leads_err, conv_known = [], None, None, False
+    lead_sel, leads_df, leads_err, conv_known, lead_diag = [], None, None, False, []
     with st.container(key="card-asm-leadpick"):
         section_header(
             3, "Lead sources (optional)",
@@ -2233,7 +2254,7 @@ def render_assessment():
             if lead_sel:
                 try:
                     with st.spinner("Fetching leads from Zoho..."):
-                        leads_df, conv_known = load_leads_for_sources(
+                        leads_df, conv_known, lead_diag = load_leads_for_sources(
                             tuple(sorted(lead_sel)), (datetime.combine(pstart, datetime.min.time()) - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00+00:00"),
                         )
                 except Exception as err:
@@ -2387,6 +2408,9 @@ def render_assessment():
         if conv_known and leads_now["added"]:
             txt += f", **{leads_now['converted']}** converted ({leads_now['converted'] / leads_now['added'] * 100:.0f}%)"
         points.append(txt + ".")
+        by_status = leads_now["df"]["Status"].replace("", "(no status)").value_counts()
+        if len(by_status):
+            points.append("Lead status: " + ", ".join(f"**{k}** {int(v)}" for k, v in by_status.head(6).items()) + ".")
 
     # ------------------------------------------------------------------ scorecard
     with st.container(key="card-asm-score"):
@@ -2521,11 +2545,22 @@ def render_assessment():
                     conv_by = ldf.groupby("Source")["Converted"].sum().reindex(lead_sel).fillna(0).astype(int).values
                     src_table["Converted"] = conv_by
                 st.dataframe(src_table, hide_index=True, **DF_WIDTH)
-                st.caption("By lead status")
+                st.caption("By lead status (as set on each lead in Zoho)")
                 if lead_status_rows:
                     st.dataframe(pd.DataFrame(lead_status_rows, columns=["Status", "Leads"]), hide_index=True, **DF_WIDTH)
                 else:
                     st.caption("No leads in this period.")
+
+    if leads_now is not None and lead_diag:
+        with st.expander("How these leads were found"):
+            for dgn in lead_diag:
+                span = (f", created between {dgn['oldest']:%d %b %Y} and {dgn['newest']:%d %b %Y}"
+                        if dgn["newest"] is not None else "")
+                st.write(f"**{dgn['source']}** - Zoho returned {dgn['returned']:,} lead(s){span} ({dgn['how']}).")
+            st.caption(
+                f"Only leads whose Created Time falls in {label} are counted above "
+                f"({leads_now['added']:,} of the {sum(d['returned'] for d in lead_diag):,} returned)."
+            )
 
     stage_rows = [
         (str(r["Stage"]), int(r["Deals"]), STAGE_DOT_COLORS.get(str(r["Stage"]).lower(), "#7C83FF"))
