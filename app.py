@@ -2,6 +2,8 @@ import calendar
 import hmac
 import html as html_lib
 import inspect
+import io
+import re
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -83,7 +85,11 @@ html,body,[class*="css"],.stApp,button,input,textarea,select{font-family:'Inter'
 .pe-kpi-link .v{color:var(--accent-2)!important}
 .pe-kpi{min-height:112px;box-sizing:border-box}
 .pe-kpi.bad{border-top-color:var(--bad)}.pe-kpi.warn{border-top-color:var(--warn)}.pe-kpi.good{border-top-color:var(--good)}.pe-kpi.muted{border-top-color:var(--faint)}.pe-kpi.cyan{border-top-color:var(--accent-2)}
-.pe-kpi-sub{font-size:.74rem;color:var(--muted);margin-top:2px}
+.pe-kpi-sub{font-size:.74rem;color:var(--muted);margin-top:2px}.pe-kpi-sub.good{color:var(--good)}.pe-kpi-sub.bad{color:var(--bad)}
+.pe-callout{background:var(--surface-2);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:12px;padding:12px 16px;margin:12px 0 4px;color:var(--text);font-size:.88rem;line-height:1.65}
+.pe-callout b{color:#fff}
+.pe-empty{display:flex;gap:16px;align-items:flex-start;padding:6px 2px}.pe-empty .ico{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;background:var(--accent-soft);color:var(--accent);border:1px solid rgba(124,131,255,.3);flex:none}
+.pe-empty .t{font-weight:700;color:var(--text);font-size:1rem;margin-bottom:6px}.pe-empty ol{margin:0;padding-left:1.1rem;color:var(--muted);font-size:.88rem;line-height:1.7}
 .pe-anchor{scroll-margin-top:20px;height:0}
 [data-testid="stMetric"]{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:14px 18px}
 </style>
@@ -116,7 +122,7 @@ def section_header(num, title, subtitle="", anchor_id=None):
     )
 
 
-def kpi_tile(label, value, href=None, tone=""):
+def kpi_tile(label, value, href=None, tone="", sub="", sub_tone=""):
     """One KPI tile. With href it becomes a clickable link that jumps to that
     section of the page (inline <span>s rather than <div>s inside the <a>, as
     block elements inside a link get split into separate links by the
@@ -126,7 +132,8 @@ def kpi_tile(label, value, href=None, tone=""):
             f'<a href="#{esc(href)}" class="pe-kpi pe-kpi-link {tone}">'
             f'<span class="l">{esc(label)} ↓</span><span class="v">{esc(value)}</span></a>'
         )
-    return f'<div class="pe-kpi {tone}"><div class="l">{esc(label)}</div><div class="v">{esc(value)}</div></div>'
+    sub_html = f'<div class="pe-kpi-sub {sub_tone}">{esc(sub)}</div>' if sub else ""
+    return f'<div class="pe-kpi {tone}"><div class="l">{esc(label)}</div><div class="v">{esc(value)}</div>{sub_html}</div>'
 
 
 def _full_width():
@@ -255,7 +262,8 @@ def zoho_deal_url(deal_id):
 # empty, so they're only used as a fallback.
 DEAL_FIELDS = (
     "Deal_Name,Owner,Account_Name,Appt_Date_Time,Potential_Value,Services_Value,"
-    "Monthly_Lease_Spend,Total_Lease_Value,Monthly_Network_Spend,Stage,Closing_Date"
+    "Monthly_Lease_Spend,Total_Lease_Value,Monthly_Network_Spend,Stage,Closing_Date,"
+    "Created_By,Created_Time"
 )
 CLOSED_WON_STAGE = "Closed Won"
 SOLD_DEALS_WINDOW_DAYS = 30
@@ -685,6 +693,9 @@ def load_deals():
                 "Monthly Lease Spend": float(r.get("Monthly_Lease_Spend") or 0),
                 "Total Lease Value": lease_total,
                 "Monthly Network Spend": network_monthly,
+                "Created By": (r.get("Created_By") or {}).get("name") or "",
+                "Created By Email": ((r.get("Created_By") or {}).get("email") or "").lower(),
+                "Created Time": parse_appt(r.get("Created_Time")),
             }
         )
 
@@ -695,9 +706,11 @@ def load_deals():
                 "Deal ID", "Client Name", "Account Name", "Sales Rep", "Owner Email",
                 "Parsed Date", "Status", "Closing Date", "Monthly Lease Spend",
                 "Total Lease Value", "Monthly Network Spend",
+                "Created By", "Created By Email", "Created Time",
             ]
         )
     df["Parsed Date"] = pd.to_datetime(df["Parsed Date"], errors="coerce")
+    df["Created Time"] = pd.to_datetime(df["Created Time"], errors="coerce")
     return df
 
 
@@ -887,7 +900,7 @@ if st.sidebar.button("Log out", **FULL_WIDTH):
     st.session_state["password_correct"] = False
     st.rerun()
 
-tab_renewals, tab_sales = st.tabs(["Renewals", "Sales Pipeline"])
+tab_renewals, tab_sales, tab_assess = st.tabs(["Renewals", "Sales Pipeline", "Assessment"])
 
 # Filled in as each card renders; the PDF briefing is built from this.
 report = {}
@@ -1601,6 +1614,640 @@ with tab_sales:
 
 
 # =====================================================================
+# TAB 3 — ASSESSMENT
+# One person at a time: deals they created in Zoho (credited by "Created By")
+# next to their outbound phone activity from the Grandstream UCM CDR export.
+# =====================================================================
+CONVERSATION_SECONDS = 30  # a connected call at least this long counts as a real conversation
+ASM_TIMEFRAMES = ["Week", "Month", "Quarter", "Year"]
+ASM_CDR_KEEP = [
+    "CDR", "Caller Number", "Caller Name", "Callee Number", "Start Time", "Talk Time",
+    "Call Status", "Call Type", "Unique ID", "Session",
+]
+ASM_CDR_NEED = ["CDR", "Caller Number", "Callee Number", "Start Time", "Call Status", "Call Type"]
+asm_pdf_slot = None  # the assessment PDF button is placed here, once the PDF code further down has been defined
+
+
+# ---- call records (Grandstream UCM CDR) ----
+def _cdr_decode(raw):
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16")
+    if raw[:3] == b"\xef\xbb\xbf":
+        return raw[3:].decode("utf-8")
+    if raw[:200].count(b"\x00") > 40:
+        return raw.decode("utf-16-le")
+    for enc in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("latin-1", errors="replace")
+
+
+def _cdr_expand(blobs):
+    """Unpacks .tar / .zip / .gz uploads (the UCM's bulk download is a tar of monthly CSVs)."""
+    import gzip
+    import tarfile
+    import zipfile
+
+    out = []
+    for b in blobs:
+        if b[:2] == b"\x1f\x8b":
+            try:
+                out.extend(_cdr_expand([gzip.decompress(b)]))
+                continue
+            except OSError:
+                pass
+        if b[:4] == b"PK\x03\x04":
+            with zipfile.ZipFile(io.BytesIO(b)) as z:
+                inner = [z.read(n) for n in sorted(z.namelist()) if not n.endswith("/") and "__MACOSX" not in n]
+            out.extend(_cdr_expand(inner))
+            continue
+        if len(b) > 262 and b[257:262] == b"ustar":
+            with tarfile.open(fileobj=io.BytesIO(b)) as t:
+                inner = [t.extractfile(m).read() for m in sorted(t.getmembers(), key=lambda m: m.name) if m.isfile()]
+            out.extend(_cdr_expand(inner))
+            continue
+        out.append(b)
+    return out
+
+
+def parse_cdr_outbound(blobs):
+    """Grandstream UCM CDR export(s) -> one row per OUTBOUND call.
+
+    The UCM writes a `main_cdr` row per call plus `sub_cdr` rows for each leg, so only `main_cdr` rows are read.
+    A call is 'connected' when the UCM says ANSWERED and there was some talk time (a call answered with zero talk
+    is the other end hanging up as it was picked up). Overlapping exports (e.g. a monthly file plus the current
+    month's file) are de-duplicated."""
+    frames = []
+    for b in _cdr_expand(blobs):
+        try:
+            t = pd.read_csv(
+                io.StringIO(_cdr_decode(b)), dtype=str, keep_default_na=False,
+                usecols=lambda c: c.strip() in ASM_CDR_KEEP,
+            )
+        except (pd.errors.EmptyDataError, ValueError):
+            continue
+        t.columns = [c.strip() for c in t.columns]
+        missing = [c for c in ASM_CDR_NEED if c not in t.columns]
+        if missing:
+            raise ValueError(
+                "That doesn't look like a Grandstream UCM CDR export - missing column(s): " + ", ".join(missing)
+            )
+        frames.append(t)
+    if not frames:
+        raise ValueError("No call records were found in the file(s) you uploaded.")
+    t = pd.concat(frames, ignore_index=True)
+    for c in ("Caller Name", "Talk Time", "Unique ID", "Session"):
+        if c not in t.columns:
+            t[c] = ""
+    t = t[(t["CDR"].str.strip() == "main_cdr") & (t["Call Type"].str.strip().str.lower() == "outbound")].copy()
+    t = t.drop_duplicates(subset=["Session", "Unique ID", "Start Time", "Caller Number"])
+    out = pd.DataFrame(
+        {
+            "ts": pd.to_datetime(t["Start Time"].str.strip(), errors="coerce"),
+            "ext": t["Caller Number"].str.strip(),
+            "name": t["Caller Name"].str.strip(),
+            "dialled": t["Callee Number"].str.strip(),
+            "status": t["Call Status"].str.strip().str.upper(),
+            "talk_s": pd.to_numeric(t["Talk Time"], errors="coerce").fillna(0).astype(int),
+        }
+    ).dropna(subset=["ts"])
+    out["name"] = out["name"].where(out["name"] != "", "Ext " + out["ext"])
+    out["connected"] = (out["status"] == "ANSWERED") & (out["talk_s"] > 0)
+    return out.sort_values("ts").reset_index(drop=True)
+
+
+def _norm_name(v):
+    return " ".join(re.sub(r"[^a-z0-9 ]", " ", str(v).lower()).split())
+
+
+def suggest_identities(person, identities):
+    """Which phone identities (extension + name on the CDR) look like this person?
+
+    Extensions get handed on from one person to the next, so the name stamped on each call record is the safer
+    thing to match on. Returns (list of (ext, name), how it matched)."""
+    pn = _norm_name(person)
+    ptoks = pn.split()
+    if not ptoks:
+        return [], "none"
+    exact = [k for k in identities if _norm_name(k[1]) == pn]
+    if exact:
+        return exact, "exact"
+    first = [
+        k for k in identities
+        if _norm_name(k[1]).split()
+        and _norm_name(k[1]).split()[0] == ptoks[0]
+        and set(_norm_name(k[1]).split()) <= set(ptoks)
+    ]
+    return (first, "first name only") if first else ([], "none")
+
+
+# ---- Zoho users ----
+@st.cache_data(ttl=3600)
+def get_zoho_users():
+    """Active Zoho users as [{'name', 'email'}], or ([], reason) when the token can't read the Users API."""
+    try:
+        token = get_access_token()
+        headers = {"Authorization": f"Zoho-oauthtoken {token}"}
+        users, page = [], 1
+        while True:
+            resp = requests.get(
+                f"{ZOHO_API_DOMAIN}/crm/v2/users", headers=headers,
+                params={"type": "ActiveUsers", "per_page": 200, "page": page}, timeout=20,
+            )
+            if resp.status_code != 200:
+                return [], f"status {resp.status_code}"
+            payload = resp.json()
+            users.extend(payload.get("users", []))
+            if not payload.get("info", {}).get("more_records"):
+                break
+            page += 1
+        return [
+            {"name": (u.get("full_name") or "").strip(), "email": (u.get("email") or "").lower()}
+            for u in users if (u.get("full_name") or "").strip()
+        ], None
+    except Exception as err:  # never let a nice-to-have lookup break the tab
+        return [], str(err)
+
+
+# ---- time frames ----
+def period_bounds(kind, ref):
+    if kind == "Week":
+        start = ref - timedelta(days=ref.weekday())
+        return start, start + timedelta(days=6)
+    if kind == "Month":
+        start = ref.replace(day=1)
+        return start, add_months(start, 1) - timedelta(days=1)
+    if kind == "Quarter":
+        start = date(ref.year, 3 * ((ref.month - 1) // 3) + 1, 1)
+        return start, add_months(start, 3) - timedelta(days=1)
+    return date(ref.year, 1, 1), date(ref.year, 12, 31)
+
+
+def shift_period(kind, ref, n):
+    if kind == "Week":
+        return ref + timedelta(days=7 * n)
+    if kind == "Month":
+        return add_months(ref, n)
+    if kind == "Quarter":
+        return add_months(ref, 3 * n)
+    return add_months(ref, 12 * n)
+
+
+def period_label(kind, start, end):
+    if kind == "Week":
+        return f"Week of {start.strftime('%d %b')} - {end.strftime('%d %b %Y')}"
+    if kind == "Month":
+        return start.strftime("%B %Y")
+    if kind == "Quarter":
+        return f"Q{(start.month - 1) // 3 + 1} {start.year}"
+    return str(start.year)
+
+
+def _between(series, start, end):
+    """Inclusive date window on a datetime Series (NaT is never inside)."""
+    return (series >= pd.Timestamp(start)) & (series < pd.Timestamp(end) + pd.Timedelta(days=1))
+
+
+def fmt_talk(seconds):
+    seconds = int(round(seconds or 0))
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds}s"
+
+
+def md_bold(text, wrap):
+    """Turns **bold** markers into whatever bold the output needs; `wrap` also escapes each piece."""
+    parts = text.split("**")
+    return "".join(wrap(p, i % 2 == 1) for i, p in enumerate(parts))
+
+
+def delta_sub(cur, prev, fmt=None, unit="", lower_is_better=False):
+    """('+4 vs 3 previous', tone) for a tile's small print."""
+    fmt = fmt or (lambda v: f"{v:,.0f}")
+    diff = cur - prev
+    if diff == 0:
+        return f"same as previous ({fmt(prev)}{unit})", ""
+    good = (diff > 0) != lower_is_better
+    sign = "+" if diff > 0 else "-"
+    return f"{sign}{fmt(abs(diff))}{unit} vs {fmt(prev)}{unit} previous", ("good" if good else "bad")
+
+
+def _bin_spec(kind):
+    return {"Week": "D", "Month": "D", "Quarter": "W", "Year": "M"}[kind]
+
+
+def bin_counts(ts, start, end, kind, mask=None):
+    """Counts per day / week / month across the period, zero-filled. Returns a list of (label, count)."""
+    freq = _bin_spec(kind)
+    periods = pd.period_range(start, end, freq=freq)
+    if mask is not None:
+        ts = ts[mask]
+    counts = ts.dt.to_period(freq).value_counts() if len(ts) else pd.Series(dtype=int)
+    out = []
+    for p in periods:
+        if freq == "D":
+            label = p.start_time.strftime("%a %d") if kind == "Week" else p.start_time.strftime("%d")
+        elif freq == "W":
+            label = max(p.start_time.date(), start).strftime("%d %b")
+        else:
+            label = p.start_time.strftime("%b")
+        out.append((label, int(counts.get(p, 0))))
+    return out
+
+
+def render_bins_chart(rows, height=190):
+    """rows: [(label, series_name, count)] in display order. Dark, non-interactive stacked columns."""
+    chart_df = pd.DataFrame(rows, columns=["Bin", "Series", "Count"])
+    chart_df["Order"] = chart_df.groupby("Series").cumcount()
+    names = list(dict.fromkeys(chart_df["Series"]))
+    palette = {"Deals created": "#7C83FF", "Connected": "#34D399", "Not connected": "#5E6A82"}
+    chart = (
+        alt.Chart(chart_df)
+        .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+        .encode(
+            x=alt.X("Bin:N", sort=alt.EncodingSortField("Order"), title="", axis=alt.Axis(labelAngle=0, labelOverlap=True)),
+            y=alt.Y("Count:Q", title="", axis=alt.Axis(tickMinStep=1)),
+            color=alt.Color(
+                "Series:N",
+                scale=alt.Scale(domain=names, range=[palette.get(n, "#7C83FF") for n in names]),
+                legend=alt.Legend(orient="top", title=None, labelColor="#8C98B0") if len(names) > 1 else None,
+            ),
+            tooltip=["Bin", "Series", "Count"],
+        )
+        .properties(height=height)
+        .configure(background="transparent")
+        .configure_axis(labelColor="#8C98B0", titleColor="#8C98B0", gridColor="#1C2740", domainColor="#26324D", tickColor="#26324D")
+        .configure_view(strokeOpacity=0)
+    )
+    try:
+        st.altair_chart(chart, width="stretch", theme=None)
+    except TypeError:
+        st.altair_chart(chart, use_container_width=True, theme=None)
+
+
+def render_assessment():
+    global asm_pdf_slot
+    today_d = now_uk.date()
+    st.session_state.setdefault("asm_ref", today_d)
+
+    # ------------------------------------------------------------------ 1. who and when
+    with st.container(key="card-asm-pick"):
+        section_header(1, "Assessment", "Pick a person and a time frame - deals created in Zoho next to their phone activity.")
+        if deals_error:
+            st.error(f"🚨 Could not load deals from Zoho, so there is nothing to assess yet: {deals_error}")
+            return
+
+        zoho_users, users_error = get_zoho_users()
+        created_names = sorted({n for n in deals_df["Created By"] if n})
+        by_key = {}
+        for name in [u["name"] for u in zoho_users] + created_names:
+            by_key.setdefault(_norm_name(name), name)
+        people = sorted(by_key.values(), key=str.lower)
+
+        pc1, pc2 = st.columns([2, 1])
+        person = pc1.selectbox(
+            "Person", people, index=None, placeholder="Search for a person...", key="asm_person",
+            help="Everyone in Zoho. Type to search.",
+        )
+        tf = pc2.selectbox("Time frame", ASM_TIMEFRAMES, index=1, key="asm_tf")
+        if users_error and not zoho_users:
+            st.caption(
+                "Showing everyone who has created a deal, because the Zoho connection can't read the full user "
+                f"list yet ({users_error}). Adding the ZohoCRM.users.READ scope to the token fixes that."
+            )
+
+        ref = st.session_state["asm_ref"]
+        s0, e0 = period_bounds(tf, ref)
+        nav = st.columns([1, 1, 1, 4])
+        if nav[0].button("Previous", key="asm_prev", **FULL_WIDTH):
+            st.session_state["asm_ref"] = shift_period(tf, ref, -1)
+        if nav[1].button(f"This {tf.lower()}", key="asm_now", **FULL_WIDTH):
+            st.session_state["asm_ref"] = today_d
+        if nav[2].button("Next", key="asm_next", disabled=e0 >= today_d, **FULL_WIDTH):
+            st.session_state["asm_ref"] = shift_period(tf, ref, 1)
+        start, end = period_bounds(tf, st.session_state["asm_ref"])
+        in_progress = start <= today_d <= end
+        label = period_label(tf, start, end)
+
+        # previous window for comparison: the same number of elapsed days when this period is still running
+        pstart, pend = period_bounds(tf, shift_period(tf, start, -1))
+        if in_progress:
+            pend = min(pend, pstart + timedelta(days=(today_d - start).days))
+            compare_label = f"the same point last {tf.lower()}"
+        else:
+            compare_label = f"the previous {tf.lower()}"
+        render_html(
+            chip(label, "accent") + " " + chip(("In progress - compared with " if in_progress else "Compared with ") + compare_label)
+        )
+
+    # ------------------------------------------------------------------ 2. call data
+    with st.container(key="card-asm-cdr"):
+        section_header(
+            2, "Call data",
+            "Upload the Grandstream UCM CDR export(s) - monthly CSVs, or the .tar / .zip / .gz bulk download as it comes.",
+        )
+        files = st.file_uploader(
+            "Grandstream CDR file(s)", accept_multiple_files=True, key="asm_cdr_files",
+            help="Nothing is stored - the files only live in this browser session.",
+        )
+        sig = tuple(sorted((f.name, f.size) for f in files)) if files else None
+        if sig != st.session_state.get("asm_cdr_sig"):
+            st.session_state["asm_cdr_sig"] = sig
+            st.session_state["asm_cdr"], st.session_state["asm_cdr_err"] = None, None
+            if files:
+                try:
+                    with st.spinner("Reading call records..."):
+                        st.session_state["asm_cdr"] = parse_cdr_outbound([f.getvalue() for f in files])
+                except Exception as err:
+                    st.session_state["asm_cdr_err"] = str(err)
+        cdr = st.session_state.get("asm_cdr")
+        if st.session_state.get("asm_cdr_err"):
+            st.error(f"Couldn't read that file: {st.session_state['asm_cdr_err']}")
+
+        identities, chosen = [], []
+        if cdr is not None:
+            counts = cdr.groupby(["ext", "name"]).size().sort_values(ascending=False)
+            identities = list(counts.index)
+            ident_key = lambda k: f"{k[0]}|{k[1]}"
+            if cdr.empty:
+                st.warning("The file(s) loaded fine but contain no outbound calls.")
+            else:
+                render_html(
+                    chip(f"{len(cdr):,} outbound calls", "accent")
+                    + " "
+                    + chip(f"{cdr['ts'].min().strftime('%d %b %Y')} to {cdr['ts'].max().strftime('%d %b %Y')}")
+                    + " "
+                    + chip(f"{len(identities)} phone names / extensions")
+                )
+            if person:
+                suggested, how = suggest_identities(person, identities)
+                labels = {ident_key(k): f"{k[1]} (ext {k[0]}) - {int(counts[k]):,} calls" for k in identities}
+                suggested_keys = [ident_key(k) for k in suggested]
+                ms_key = f"asm_ids_{abs(hash(sig)) % 10**8}_{_norm_name(person)}"
+                chosen = st.multiselect(
+                    f"Phone identities to count as {person}",
+                    options=list(labels), default=suggested_keys, format_func=lambda k: labels[k], key=ms_key,
+                    help="Extensions get passed from person to person, so each is listed with the name on the call "
+                         "record. Tick every one that belongs to this person.",
+                )
+                if how == "first name only" and chosen == suggested_keys:
+                    st.caption("Matched on first name only - check this really is the right person before relying on the call numbers.")
+                elif how == "none" and not chosen:
+                    st.caption(f"No call-record name matches {person} - pick their extension(s) from the list above.")
+        elif not st.session_state.get("asm_cdr_err"):
+            st.caption("No call data loaded yet - add the CDR to include phone activity in the assessment.")
+
+    # ------------------------------------------------------------------ results
+    if not person:
+        with st.container(key="card-asm-empty"):
+            render_html(
+                '<div class="pe-empty"><div class="ico"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" '
+                'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+                '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></div>'
+                '<div><div class="t">Choose someone to assess</div><ol>'
+                "<li>Search for the person in the picker above</li>"
+                "<li>Choose Week, Month, Quarter or Year (and step back through earlier periods)</li>"
+                "<li>Upload the CDR export to add their phone activity</li></ol></div></div>"
+            )
+        return
+
+    pkey = _norm_name(person)
+    mine = deals_df[deals_df["Created By"].map(_norm_name) == pkey]
+
+    def deal_stats(a, b):
+        created = mine[_between(mine["Created Time"], a, b)]
+        closing = pd.to_datetime(mine["Closing Date"], errors="coerce")
+        won_all = stage_in(mine["Status"], STAGES_WON) if len(mine) else pd.Series(dtype=bool)
+        won_period = mine[won_all & _between(closing, a, b)] if len(mine) else mine
+        cohort_won = created[stage_in(created["Status"], STAGES_WON)] if len(created) else created
+        return created, won_period, cohort_won
+
+    created, won_period, cohort_won = deal_stats(start, end)
+    p_created, p_won_period, p_cohort_won = deal_stats(pstart, pend)
+
+    def call_stats(a, b):
+        if cdr is None or not chosen:
+            return None
+        c = cdr[(cdr["ext"] + "|" + cdr["name"]).isin(chosen)]
+        c = c[_between(c["ts"], a, b)]
+        conn = c[c["connected"]]
+        return {
+            "df": c, "made": len(c), "connected": len(conn),
+            "conversations": int((conn["talk_s"] >= CONVERSATION_SECONDS).sum()),
+            "talk": int(conn["talk_s"].sum()),
+        }
+
+    calls = call_stats(start, end)
+    p_calls = call_stats(pstart, pend)
+
+    n_created, n_won, n_cohort = len(created), len(won_period), len(cohort_won)
+    won_value = float(won_period["Total Lease Value"].sum())
+    p_won_value = float(p_won_period["Total Lease Value"].sum())
+    cohort_pct = (n_cohort / n_created * 100) if n_created else 0.0
+
+    deal_tiles, call_tiles = [], []
+    sub, tone = delta_sub(n_created, len(p_created))
+    deal_tiles.append(("Deals created", n_created, "", sub, tone))
+    sub, tone = delta_sub(n_won, len(p_won_period))
+    deal_tiles.append(("Closed won in period", n_won, "good", sub, tone))
+    deal_tiles.append((
+        "This period's deals now won", f"{n_cohort} of {n_created}" if n_created else "-", "cyan",
+        f"{cohort_pct:.0f}% conversion" if n_created else "no deals created", "",
+    ))
+    sub, tone = delta_sub(won_value, p_won_value, fmt=money_short)
+    deal_tiles.append(("Won lease value", money_short(won_value), "good", sub, tone))
+
+    if calls is None:
+        why = "Upload the CDR" if cdr is None else "Pick a phone identity"
+        for lab, t_ in (("Calls made", ""), ("Connected", "good"), (f"Conversations {CONVERSATION_SECONDS}s+", "cyan"), ("Talk time", "warn")):
+            call_tiles.append((lab, "-", t_, why, ""))
+    else:
+        pc = p_calls
+        sub, tone = delta_sub(calls["made"], pc["made"])
+        call_tiles.append(("Calls made", f"{calls['made']:,}", "", sub, tone))
+        rate = calls["connected"] / calls["made"] * 100 if calls["made"] else 0.0
+        p_rate = pc["connected"] / pc["made"] * 100 if pc["made"] else 0.0
+        diff_pts = round(rate) - round(p_rate)
+        sub = (f"same rate as previous ({p_rate:.0f}%)" if diff_pts == 0
+               else f"{'+' if diff_pts > 0 else '-'}{abs(diff_pts)} pts vs {p_rate:.0f}% previous")
+        tone = "" if diff_pts == 0 else ("good" if diff_pts > 0 else "bad")
+        call_tiles.append(("Connected", f"{calls['connected']:,} · {rate:.0f}%", "good", sub, tone))
+        sub, tone = delta_sub(calls["conversations"], pc["conversations"])
+        call_tiles.append((f"Conversations {CONVERSATION_SECONDS}s+", f"{calls['conversations']:,}", "cyan", sub, tone))
+        sub, tone = delta_sub(calls["talk"], pc["talk"], fmt=fmt_talk)
+        call_tiles.append(("Talk time", fmt_talk(calls["talk"]), "warn", sub, tone))
+
+    # ---- highlights
+    points = []
+    if n_created:
+        by_owner = created["Sales Rep"].replace("", "Unassigned").value_counts()
+        points.append(
+            f"**{person}** created **{n_created}** deal(s) in {label} (previous: {len(p_created)}), "
+            f"mostly for **{by_owner.index[0]}** ({int(by_owner.iloc[0])})."
+        )
+    else:
+        points.append(f"**{person}** created **no deals** in {label} (previous: {len(p_created)}).")
+    if n_created or n_won:
+        points.append(
+            f"**{n_won}** of their deals closed won in the period, worth **{money(won_value)}** in lease value; "
+            f"**{n_cohort}** of the **{n_created}** created this period have already been won."
+        )
+    if calls is not None:
+        if calls["made"]:
+            avg = calls["talk"] / calls["connected"] if calls["connected"] else 0
+            days_active = calls["df"]["ts"].dt.date.nunique()
+            points.append(
+                f"**{calls['made']:,}** outbound call(s) over **{days_active}** active day(s), **{calls['connected']:,}** connected "
+                f"({calls['connected'] / calls['made'] * 100:.0f}%); **{fmt_talk(calls['talk'])}** talk time, "
+                f"averaging **{fmt_talk(avg)}** per connected call."
+            )
+            if n_created and calls["connected"]:
+                points.append(f"That is roughly **{calls['connected'] / n_created:.0f}** connected calls per deal created.")
+        else:
+            points.append(
+                "**No outbound calls** were found for the selected phone identity in this period - check the "
+                "identities ticked above, and that the CDR covers these dates."
+            )
+        if cdr is not None and len(cdr) and (cdr["ts"].min().date() > start or (cdr["ts"].max().date() < min(end, today_d))):
+            points.append(
+                f"Heads up: the CDR only covers **{cdr['ts'].min().strftime('%d %b %Y')} to {cdr['ts'].max().strftime('%d %b %Y')}**, "
+                "so call numbers for this period may be understated."
+            )
+
+    # ------------------------------------------------------------------ 3. scorecard
+    with st.container(key="card-asm-score"):
+        section_header(3, f"{person} - scorecard", f"{label}  ·  deals credited by Created By in Zoho")
+        render_html('<div class="pe-subhead"><span class="n">Deals</span></div>')
+        for col, (lab, val, t_, sub_, st_) in zip(st.columns(4), deal_tiles):
+            with col:
+                render_html(kpi_tile(lab, val, tone=t_, sub=sub_, sub_tone=st_))
+        render_html('<div class="pe-subhead"><span class="n">Phone calls (outbound)</span></div>')
+        for col, (lab, val, t_, sub_, st_) in zip(st.columns(4), call_tiles):
+            with col:
+                render_html(kpi_tile(lab, val, tone=t_, sub=sub_, sub_tone=st_))
+        st.caption(
+            f"Connected = answered with some talk time. A conversation is a connected call of {CONVERSATION_SECONDS} seconds or more."
+        )
+        render_html(
+            '<div class="pe-callout">'
+            + "<br>".join("• " + md_bold(p, lambda t, b: f"<b>{esc(t)}</b>" if b else esc(t)) for p in points)
+            + "</div>"
+        )
+        render_html('<div style="height:10px"></div>')
+        asm_pdf_slot = st.empty()
+
+    # ------------------------------------------------------------------ 4. activity
+    deal_bins = bin_counts(created["Created Time"], start, end, tf)
+    call_conn_bins = call_other_bins = None
+    if calls is not None:
+        call_conn_bins = bin_counts(calls["df"]["ts"], start, end, tf, mask=calls["df"]["connected"])
+        all_bins = bin_counts(calls["df"]["ts"], start, end, tf)
+        call_other_bins = [(lab, a - c) for (lab, a), (_, c) in zip(all_bins, call_conn_bins)]
+    with st.container(key="card-asm-activity"):
+        gran_word = {"D": "Per day", "W": "Per week", "M": "Per month"}[_bin_spec(tf)]
+        section_header(4, "Activity over time", f"{gran_word} across {label}.")
+        ac1, ac2 = st.columns(2)
+        with ac1:
+            st.caption("Deals created")
+            render_bins_chart([(lab, "Deals created", n) for lab, n in deal_bins])
+        with ac2:
+            st.caption("Outbound calls")
+            if call_conn_bins is None:
+                st.caption("Add the CDR and pick a phone identity to see calls here.")
+            else:
+                render_bins_chart(
+                    [(lab, "Connected", n) for lab, n in call_conn_bins]
+                    + [(lab, "Not connected", n) for lab, n in call_other_bins]
+                )
+
+    # ------------------------------------------------------------------ 5. deals
+    created_sorted = created.sort_values("Created Time", ascending=False)
+    with st.container(key="card-asm-deals"):
+        section_header(5, "Deals", f"Created by {person} in {label}, and the ones that closed won.")
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            st.caption("Booked for (deal owner)")
+            by_owner = created["Sales Rep"].replace("", "Unassigned").value_counts()
+            if by_owner.empty:
+                st.caption("No deals created in this period.")
+            else:
+                render_leaderboard(by_owner, "Sales consultant", "Deals created")
+        with dc2:
+            st.caption("Where this period's deals stand now")
+            stage_df = created["Status"].replace("", "(no stage)").value_counts().rename_axis("Stage").reset_index(name="Deals")
+            if stage_df.empty:
+                st.caption("No deals created in this period.")
+            else:
+                st.dataframe(stage_df, hide_index=True, **DF_WIDTH)
+
+        st.caption(f"Deals created ({n_created})")
+        created_rows = []
+        if created_sorted.empty:
+            st.caption("None in this period.")
+        else:
+            view = created_sorted[["Created Time", "Client Name", "Account Name", "Sales Rep", "Status", "Parsed Date", "Deal ID"]].copy()
+            view["Created Time"] = view["Created Time"].dt.strftime("%d/%m/%Y %H:%M")
+            view["Appointment"] = view["Parsed Date"].apply(lambda d: d.strftime("%d/%m/%Y %H:%M") if pd.notna(d) else "-")
+            view["Open in Zoho"] = view["Deal ID"].apply(zoho_deal_url)
+            view = view.drop(columns=["Parsed Date", "Deal ID"]).rename(
+                columns={"Created Time": "Created", "Client Name": "Deal", "Sales Rep": "Booked for", "Status": "Stage"}
+            )
+            created_rows = view.drop(columns=["Open in Zoho"]).values.tolist()
+            st.dataframe(view, hide_index=True, **DF_WIDTH,
+                         column_config={"Open in Zoho": st.column_config.LinkColumn(display_text="Open ↗")})
+
+        st.caption(f"Closed won in period ({n_won})")
+        won_rows = []
+        if won_period.empty:
+            st.caption("None in this period.")
+        else:
+            wv = won_period.copy()
+            wv["Closing"] = pd.to_datetime(wv["Closing Date"], errors="coerce")
+            wv = wv.sort_values("Closing", ascending=False)
+            won_rows = [
+                [r["Client Name"], r["Sales Rep"] or "Unassigned", fmt_date_uk(r["Closing"]),
+                 money(r["Monthly Network Spend"]), money(r["Total Lease Value"])]
+                for _, r in wv.iterrows()
+            ]
+            wview = pd.DataFrame(won_rows, columns=["Deal", "Booked for", "Closed", "Monthly network", "Lease value"])
+            wview["Open in Zoho"] = wv["Deal ID"].apply(zoho_deal_url).values
+            st.dataframe(wview, hide_index=True, **DF_WIDTH,
+                         column_config={"Open in Zoho": st.column_config.LinkColumn(display_text="Open ↗")})
+
+    stage_rows = [
+        (str(r["Stage"]), int(r["Deals"]), STAGE_DOT_COLORS.get(str(r["Stage"]).lower(), "#7C83FF"))
+        for _, r in (created["Status"].replace("", "(no stage)").value_counts().rename_axis("Stage").reset_index(name="Deals").iterrows())
+    ]
+    report["assessment"] = {
+        "person": person, "tf": tf, "label": label, "compare": compare_label,
+        "deal_tiles": deal_tiles, "call_tiles": call_tiles, "points": points,
+        "deal_bins": deal_bins,
+        "call_bins": None if call_conn_bins is None else [
+            (lab, a + b, c) for (lab, a), (_, b), (_, c) in zip(call_conn_bins, call_other_bins, call_conn_bins)
+        ],
+        "booked_for": [(k, int(v)) for k, v in created["Sales Rep"].replace("", "Unassigned").value_counts().items()],
+        "stage_rows": stage_rows, "created_rows": created_rows, "won_rows": won_rows,
+        "n_created": n_created, "n_won": n_won, "won_value": won_value,
+    }
+
+
+def money_short(v):
+    return f"£{v:,.0f}" if abs(v) >= 1000 else f"£{v:,.2f}"
+
+
+def fmt_date_uk(v):
+    return v.strftime("%d/%m/%Y") if pd.notna(v) else "-"
+
+
+with tab_assess:
+    render_assessment()
+
+
+# =====================================================================
 # PDF BRIEFING — a 2-3 page dark-themed summary of both tabs, built from
 # whatever is currently on screen (filters, date ranges and all).
 # Needs the `reportlab` package; if it isn't installed the rest of the app
@@ -1614,7 +2261,7 @@ try:
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import mm
     from reportlab.platypus import (
-        BaseDocTemplate, CondPageBreak, Flowable, Frame, PageTemplate,
+        BaseDocTemplate, CondPageBreak, Flowable, Frame, PageBreak, PageTemplate,
         Paragraph, Spacer, Table, TableStyle,
     )
     from reportlab.pdfbase.pdfmetrics import stringWidth
@@ -1733,9 +2380,13 @@ if REPORTLAB_OK:
             c.drawString(11.5 * mm, 2.3 * mm, _fit(self.subtitle, "Helvetica", 7.3, self.width - 12 * mm))
 
     class _KpiRow(Flowable):
+        """Tiles of (label, value, tone) or (label, value, tone, small print, small-print tone)."""
+
         def __init__(self, width, items):
             super().__init__()
-            self.width, self.height, self.items = width, 17 * mm, items
+            self.width, self.items = width, items
+            self.has_sub = any(len(i) > 3 and i[3] for i in items)
+            self.height = (21 if self.has_sub else 17) * mm
 
         def wrap(self, aw, ah):
             return self.width, self.height
@@ -1745,7 +2396,10 @@ if REPORTLAB_OK:
             gap = 3 * mm
             n = len(self.items)
             w = (self.width - gap * (n - 1)) / n
-            for i, (label, value, tone) in enumerate(self.items):
+            for i, item in enumerate(self.items):
+                label, value, tone = item[0], item[1], item[2]
+                sub = item[3] if len(item) > 3 else ""
+                sub_tone = item[4] if len(item) > 4 else ""
                 x = i * (w + gap)
                 c.setFillColor(_hx("surface"))
                 c.setStrokeColor(_hx("border"))
@@ -1762,11 +2416,15 @@ if REPORTLAB_OK:
                 c.drawString(x + 2.5 * mm, h - 5.6 * mm, _fit(lab, "Helvetica-Bold", lsize, w - 5 * mm))
                 value = _clean(value)
                 size = 17
-                while size > 8 and stringWidth(value, "Helvetica-Bold", size) > w - 6 * mm:
+                while size > 8 and stringWidth(value, "Helvetica-Bold", size) > w - 5 * mm:
                     size -= 1
                 c.setFillColor(_hx("text"))
                 c.setFont("Helvetica-Bold", size)
-                c.drawString(x + 2.5 * mm, 3.6 * mm, value)
+                c.drawString(x + 2.5 * mm, (8.4 if sub else 3.6) * mm, value)
+                if sub:
+                    c.setFillColor(_hx({"good": "good", "bad": "bad"}.get(sub_tone, "muted")))
+                    c.setFont("Helvetica", 5.9)
+                    c.drawString(x + 2.5 * mm, 2.9 * mm, _fit(sub, "Helvetica", 5.9, w - 5 * mm))
 
     class _BarList(Flowable):
         """Horizontal bars: label on the left, value on the right."""
@@ -1804,9 +2462,12 @@ if REPORTLAB_OK:
                 c.drawRightString(self.width, y + 2.1 * mm, self.fmt(value))
 
     class _ColumnChart(Flowable):
-        def __init__(self, width, cols, height=36 * mm):
+        """Columns of (label, value, colour, sub-label) or (..., inner) where `inner` is drawn over the base of the column."""
+
+        def __init__(self, width, cols, height=36 * mm, label_every=1, show_values=True):
             super().__init__()
-            self.width, self.height, self.cols = width, height, cols  # cols: (label, value, colour, sublabel)
+            self.width, self.height, self.cols = width, height, cols
+            self.label_every, self.show_values = label_every, show_values
 
         def wrap(self, aw, ah):
             return self.width, self.height
@@ -1816,26 +2477,34 @@ if REPORTLAB_OK:
             n = len(self.cols)
             pitch = self.width / n
             base, top = 8 * mm, self.height - 5 * mm
-            vmax = max([v for _, v, _, _ in self.cols] + [1])
+            vmax = max([col[1] for col in self.cols] + [1])
             c.setStrokeColor(_hx("border"))
             c.setLineWidth(0.6)
             c.line(0, base, self.width, base)
-            for i, (label, value, colour, sub) in enumerate(self.cols):
+            for i, col in enumerate(self.cols):
+                label, value, colour, sub = col[0], col[1], col[2], col[3]
+                inner = col[4] if len(col) > 4 else None
                 x = i * pitch
                 bh = (top - base) * (value / vmax)
                 if value > 0:
                     c.setFillColor(_hx(colour))
                     c.roundRect(x + pitch * 0.18, base, pitch * 0.64, max(bh, 1.2 * mm), 0.9 * mm, fill=1, stroke=0)
-                    c.setFillColor(_hx("text"))
-                    c.setFont("Helvetica-Bold", 6.6)
-                    c.drawCentredString(x + pitch / 2, base + max(bh, 1.2 * mm) + 1 * mm, str(int(value)))
-                c.setFillColor(_hx("muted"))
-                c.setFont("Helvetica", 5.6)
-                c.drawCentredString(x + pitch / 2, base - 3.2 * mm, label)
-                if sub:
-                    c.setFillColor(_hx("faint"))
-                    c.setFont("Helvetica", 5.2)
-                    c.drawCentredString(x + pitch / 2, base - 6 * mm, sub)
+                    if inner:
+                        c.setFillColor(_hx("good"))
+                        ih = (top - base) * (inner / vmax)
+                        c.roundRect(x + pitch * 0.18, base, pitch * 0.64, max(ih, 1.0 * mm), 0.9 * mm, fill=1, stroke=0)
+                    if self.show_values:
+                        c.setFillColor(_hx("text"))
+                        c.setFont("Helvetica-Bold", 6.6)
+                        c.drawCentredString(x + pitch / 2, base + max(bh, 1.2 * mm) + 1 * mm, str(int(value)))
+                if i % self.label_every == 0:
+                    c.setFillColor(_hx("muted"))
+                    c.setFont("Helvetica", 5.6)
+                    c.drawCentredString(x + pitch / 2, base - 3.2 * mm, label)
+                    if sub:
+                        c.setFillColor(_hx("faint"))
+                        c.setFont("Helvetica", 5.2)
+                        c.drawCentredString(x + pitch / 2, base - 6 * mm, sub)
 
     def _styles():
         mk = ParagraphStyle
@@ -1912,6 +2581,92 @@ if REPORTLAB_OK:
 
     def _fmt_date(v):
         return v.strftime("%d/%m/%Y") if pd.notna(v) else "-"
+
+    def _assessment_story(A, st, W, num):
+        """The assessment page(s): used on its own and as the last page of the full briefing."""
+        story = [_Section(W, num, f"Assessment - {A['person']}", f"{A['label']}  -  compared with {A['compare']}"),
+                 Spacer(1, 1.5 * mm), Paragraph("DEALS  -  credited by Created By in Zoho", st["lbl"]), Spacer(1, 1.5 * mm),
+                 _KpiRow(W, A["deal_tiles"]), Spacer(1, 3.5 * mm),
+                 Paragraph("PHONE CALLS  -  outbound, from the Grandstream UCM call records", st["lbl"]), Spacer(1, 1.5 * mm),
+                 _KpiRow(W, A["call_tiles"]), Spacer(1, 3.5 * mm)]
+        story.append(_callout(st, W, [md_bold(p, lambda t, b: _bold(t) if b else _t(t)) for p in A["points"]]))
+        story.append(Spacer(1, 4 * mm))
+
+        half = (W - 6 * mm) / 2
+        def chart(cols, colour):
+            n = len(cols)
+            return _ColumnChart(half, [(lab, v, colour, "", *extra) for lab, v, *extra in cols], height=28 * mm,
+                                label_every=max(1, -(-n // 12)), show_values=n <= 16)
+        left = [Paragraph(f"DEALS CREATED  -  {_t(A['tf']).lower()}", st["lbl"]), Spacer(1, 1.5 * mm),
+                chart(A["deal_bins"], "accent") if any(v for _, v in A["deal_bins"])
+                else Paragraph("No deals were created in this period.", st["note"])]
+        if A["call_bins"] is None or not any(v for _, v, _c in A["call_bins"]):
+            right = [Paragraph("OUTBOUND CALLS", st["lbl"]), Spacer(1, 1.5 * mm),
+                     Paragraph("No call data was loaded for this assessment." if A["call_bins"] is None
+                               else "No outbound calls found for this person in the period.", st["note"])]
+        else:
+            right = [Paragraph("OUTBOUND CALLS  -  total, with connected in green", st["lbl"]), Spacer(1, 1.5 * mm),
+                     chart(A["call_bins"], "faint")]
+        pair, _ = _pair(left, right, W)
+        story += [pair, Spacer(1, 4 * mm)]
+
+        if A["booked_for"]:
+            hh = (W - 6 * mm) / 2
+            lb = [Paragraph("BOOKED FOR (DEAL OWNER)", st["lbl"]), Spacer(1, 1.5 * mm),
+                  _BarList(hh, [(k, v) for k, v in A["booked_for"][:6]], color="accent", label_w=32 * mm, fmt=lambda v: f"{int(v)}")]
+            rb = [Paragraph("WHERE THIS PERIOD'S DEALS STAND", st["lbl"]), Spacer(1, 1.5 * mm),
+                  _BarList(hh, [(k, v, c) for k, v, c in A["stage_rows"][:6]], color="accent", label_w=34 * mm, fmt=lambda v: f"{int(v)}")]
+            pair2, _ = _pair(lb, rb, W)
+            story += [pair2, Spacer(1, 4 * mm)]
+
+        if A["created_rows"]:
+            story.append(CondPageBreak(50 * mm))
+            story += [Paragraph(f"DEALS CREATED  -  {A['n_created']} in the period", st["lbl"]), Spacer(1, 1.5 * mm)]
+            rows = [[r[0], {"t": r[1], "bold": True}, r[2], r[3], r[4], r[5]] for r in A["created_rows"][:6]]
+            story.append(_table(st, ["Created", "Deal", "Account", "Booked for", "Stage", "Appointment"], rows,
+                                [26 * mm, 40 * mm, 34 * mm, 30 * mm, 24 * mm, 28 * mm]))
+            if len(A["created_rows"]) > 6:
+                story += [Spacer(1, 1 * mm), Paragraph(f"Showing the latest 6 of {len(A['created_rows'])} - the full list is in the app.", st["note"])]
+            story.append(Spacer(1, 3 * mm))
+        if A["won_rows"]:
+            story.append(CondPageBreak(40 * mm))
+            story += [Paragraph(f"CLOSED WON IN THE PERIOD  -  {A['n_won']} deal(s), {_t(money_short(A['won_value']))} lease value", st["lbl"]),
+                      Spacer(1, 1.5 * mm)]
+            rows = [[{"t": r[0], "bold": True}, r[1], r[2], r[3], r[4]] for r in A["won_rows"][:5]]
+            story.append(_table(st, ["Deal", "Booked for", "Closed", "Monthly network", "Lease value"], rows,
+                                [62 * mm, 40 * mm, 24 * mm, 28 * mm, 28 * mm], right=(3, 4)))
+            if len(A["won_rows"]) > 5:
+                story += [Spacer(1, 1 * mm), Paragraph(f"Showing the latest 5 of {len(A['won_rows'])} - the full list is in the app.", st["note"])]
+        return story
+
+    def _render_pdf(story, title):
+        W = A4[0] - 28 * mm
+
+        def _page(canv, doc):
+            canv.saveState()
+            canv.setFillColor(_hx("bg"))
+            canv.rect(0, 0, A4[0], A4[1], fill=1, stroke=0)
+            canv.setFillColor(_hx("faint"))
+            canv.setFont("Helvetica", 6.6)
+            canv.drawString(14 * mm, 7 * mm, "SYComms  -  Renewals & Sales Command Center")
+            canv.drawRightString(A4[0] - 14 * mm, 7 * mm, f"Page {doc.page}")
+            canv.restoreState()
+
+        buf = io.BytesIO()
+        doc = BaseDocTemplate(buf, pagesize=A4, leftMargin=14 * mm, rightMargin=14 * mm, topMargin=12 * mm,
+                              bottomMargin=14 * mm, title=title, author="SYComms")
+        doc.addPageTemplates([PageTemplate(id="p", frames=[Frame(14 * mm, 14 * mm, W, A4[1] - 26 * mm, id="f",
+                                                                  leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)],
+                                           onPage=_page)])
+        doc.build(story)
+        return buf.getvalue()
+
+    def build_assessment_pdf(R):
+        """One-person assessment on its own, from the `report['assessment']` data."""
+        W = A4[0] - 28 * mm
+        story = [_Header(W, f"Assessment generated {R['generated']}"), Spacer(1, 4 * mm)]
+        story += _assessment_story(R["assessment"], _styles(), W, 1)
+        return _render_pdf(story, f"Assessment - {R['assessment']['person']}")
 
     def build_pdf_report(R):
         """Builds the PDF from the `R` dict the app fills in as it renders, returns bytes."""
@@ -2140,24 +2895,12 @@ if REPORTLAB_OK:
                 extra = f"Showing the latest {min(8, len(sdf))} of {len(sdf)}.  " if len(sdf) > 8 else ""
                 story.append(Paragraph(f"{extra}Total lease value sold this period: {_bold('£{:,.2f}'.format(sd['total']))}.", st["note"]))
 
-        def _page(canv, doc):
-            canv.saveState()
-            canv.setFillColor(_hx("bg"))
-            canv.rect(0, 0, A4[0], A4[1], fill=1, stroke=0)
-            canv.setFillColor(_hx("faint"))
-            canv.setFont("Helvetica", 6.6)
-            canv.drawString(14 * mm, 7 * mm, "SYComms  -  Renewals & Sales Command Center")
-            canv.drawRightString(A4[0] - 14 * mm, 7 * mm, f"Page {doc.page}")
-            canv.restoreState()
+        A = R.get("assessment")
+        if A:
+            story.append(PageBreak())
+            story += _assessment_story(A, st, W, 4)
 
-        buf = io.BytesIO()
-        doc = BaseDocTemplate(buf, pagesize=A4, leftMargin=14 * mm, rightMargin=14 * mm, topMargin=12 * mm,
-                              bottomMargin=14 * mm, title="SYComms Renewals & Sales Briefing", author="SYComms")
-        doc.addPageTemplates([PageTemplate(id="p", frames=[Frame(14 * mm, 14 * mm, W, A4[1] - 26 * mm, id="f",
-                                                                  leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)],
-                                           onPage=_page)])
-        doc.build(story)
-        return buf.getvalue()
+        return _render_pdf(story, "SYComms Renewals & Sales Briefing")
 
 
 # --- PDF briefing download (sidebar) ---
@@ -2177,13 +2920,31 @@ if REPORTLAB_OK:
             file_name=f"SYComms_Renewals_Sales_Briefing_{datetime.now(UK_TZ).strftime('%Y-%m-%d')}.pdf",
             mime="application/pdf",
             key="pdf_download",
-            help="A 2-3 page summary of both tabs, following the filters and date ranges currently selected.",
+            help="A 2-3 page summary of the Renewals and Sales tabs (plus an Assessment page when a person is chosen on the Assessment tab), following the filters and date ranges currently selected.",
             **FULL_WIDTH,
         )
     except Exception as pdf_err:  # never let the report take the dashboard down
         pdf_slot.caption(f"PDF briefing unavailable: {pdf_err}")
 else:
     pdf_slot.caption("PDF briefing needs the reportlab package - add `reportlab` to requirements.txt.")
+
+# --- Assessment PDF (inside the Assessment tab) ---
+if asm_pdf_slot is not None and report.get("assessment"):
+    if REPORTLAB_OK:
+        try:
+            _A = report["assessment"]
+            asm_pdf_slot.download_button(
+                "Download assessment PDF",
+                data=build_assessment_pdf({"generated": datetime.now(UK_TZ).strftime("%A %d %B %Y, %H:%M (UK time)"), "assessment": _A}),
+                file_name=f"Assessment_{re.sub(r'[^A-Za-z0-9]+', '_', _A['person']).strip('_')}_{re.sub(r'[^A-Za-z0-9]+', '_', _A['label']).strip('_')}.pdf",
+                mime="application/pdf",
+                key="asm_pdf_download",
+                help="A one-person assessment page: deals, calls and activity for the period selected above.",
+            )
+        except Exception as pdf_err:
+            asm_pdf_slot.caption(f"Assessment PDF unavailable: {pdf_err}")
+    else:
+        asm_pdf_slot.caption("PDF export needs the reportlab package - add `reportlab` to requirements.txt.")
 
 # Fill in the hero banner reserved at the top of the page now that the
 # live counts are known.
