@@ -5,6 +5,9 @@ on:
     - cron: "17 */4 * * *"   # every 4 hours (UTC)
   workflow_dispatch:          # lets you run it manually from the Actions tab
 
+permissions:
+  actions: write              # lets the keepalive step stop GitHub pausing this after 60 days
+
 jobs:
   ping:
     runs-on: ubuntu-latest
@@ -47,3 +50,6 @@ jobs:
               print("Done:", page.title())
               browser.close()
           EOF
+
+      - name: Stop GitHub pausing this workflow after 60 days
+        uses: gautamkrishnar/keepalive-workflow@v2
