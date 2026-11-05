@@ -3494,11 +3494,36 @@ def desk_metrics_for(ids):
     return got, diag
 
 
+# Zoho Desk department -> business. Matched on the department's name (case doesn't matter); anything not listed
+# falls back to the naming rules in _guess_business below, and can still be overridden in the app.
+DEPT_BUSINESS = {
+    "ithelpdesk": "SY Comms",
+    "sy comms": "SY Comms",
+    "syc - billing invoice queries": "SY Comms",
+    "syc - broadband and provisioning": "SY Comms",
+    "syc - complaints": "SY Comms",
+    "syc - credit control": "SY Comms",
+    "syc - tech support": "SY Comms",
+    "sy plus support": "SY Plus",
+    "syplus - billing": "SY Plus",
+    "syplus - credit control": "SY Plus",
+    "syplus - customer experience": "SY Plus",
+    "syplus - hello": "SY Plus",
+    "syplus - payments": "SY Plus",
+    "syplus - provisioning": "SY Plus",
+    "syplus - sales": "SY Plus",
+    "syplus - technical support": "SY Plus",
+    "syplus - terminations": "SY Plus",
+}
+
+
 def _guess_business(dept_name):
-    n = dept_name.lower()
-    if "plus" in n or "syplus" in n or "sy+" in n:
+    n = " ".join(str(dept_name).lower().split())
+    if n in DEPT_BUSINESS:
+        return DEPT_BUSINESS[n]
+    if n.startswith("syplus") or n.startswith("sy plus") or "plus" in n or n.startswith("sy+"):
         return "SY Plus"
-    if "comm" in n:
+    if n.startswith("syc ") or n.startswith("syc-") or "comm" in n:
         return "SY Comms"
     return "Other"
 
@@ -3589,7 +3614,7 @@ def render_activity():
 
     # ---- which business is each department
     with st.expander("Which business is each department?"):
-        st.caption("Guessed from the department names - change any that are wrong. Used to split SY Comms from SY Plus.")
+        st.caption("Set up in the app already - you only need to change one if a department is added or moved. Used to split SY Comms from SY Plus.")
         biz_of = {}
         dcols = st.columns(3)
         for i, (did, dname) in enumerate(sorted(depts.items(), key=lambda kv: kv[1].lower())):
