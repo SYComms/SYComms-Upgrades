@@ -930,7 +930,7 @@ if _show_token_helper:
     with st.sidebar.expander("Zoho token helper"):
         st.caption(
             "1) In the Zoho API Console (api-console.zoho.eu) open your Self Client, Generate Code with scopes "
-            "ZohoCRM.modules.ALL,ZohoCRM.settings.ALL,ZohoCRM.users.READ (10 minutes). "
+            "ZohoCRM.modules.ALL,ZohoCRM.settings.ALL,ZohoCRM.users.READ,Desk.tickets.READ,Desk.basic.READ,Desk.settings.READ (10 minutes). "
             "2) Paste the code below straight away - it works once. "
             "3) Copy the refresh token it shows into the app's Secrets under [zoho]."
         )
@@ -951,6 +951,8 @@ if _show_token_helper:
                     st.write(("✅" if _has("ZohoCRM.modules.ALL", "ZohoCRM.modules.leads.READ", "ZohoCRM.modules.leads.ALL") else "❌") + " Can read Leads")
                     st.write(("✅" if _has("ZohoCRM.users.READ", "ZohoCRM.users.ALL") else "❌") + " Can read the user list")
                     st.write(("✅" if _has("ZohoCRM.settings.ALL", "ZohoCRM.settings.fields.READ") else "❌") + " Can read field settings")
+                    st.write(("✅" if _has("Desk.tickets.READ", "Desk.tickets.ALL") else "❌") + " Can read Zoho Desk tickets")
+                    st.write(("✅" if _has("Desk.basic.READ", "Desk.basic.ALL") else "❌") + " Can read Desk departments and agents")
                 else:
                     st.error(f"Zoho refused the saved refresh token: {_r.get('error', _r)}")
             except Exception as _err:
@@ -990,7 +992,7 @@ if st.sidebar.button("Log out", **FULL_WIDTH):
     st.session_state["password_correct"] = False
     st.rerun()
 
-tab_renewals, tab_sales, tab_assess = st.tabs(["Renewals", "Sales Pipeline", "Assessment"])
+tab_renewals, tab_sales, tab_assess, tab_activity = st.tabs(["Renewals", "Sales Pipeline", "Assessment", "Activity"])
 
 # Filled in as each card renders; the PDF briefing is built from this.
 report = {}
@@ -3197,6 +3199,631 @@ def fmt_date_uk(v):
 
 with tab_assess:
     render_assessment()
+
+
+# =====================================================================
+# TAB 4 - ACTIVITY (Zoho Desk support tickets, SY Comms + SY Plus together)
+# =====================================================================
+DESK_DOMAIN_DEFAULT = "https://desk.zoho.eu"
+ACT_TIMEFRAMES = ["Week", "Month", "Quarter", "Year"]
+DESK_PAGE = 100
+DESK_MAX_PAGES = 150          # 15,000 tickets
+DESK_METRICS_CAP = 400        # tickets per period whose first-response time is looked up one by one
+DESK_TICKET_FIELDS = (
+    "id,ticketNumber,subject,departmentId,assigneeId,status,statusType,priority,channel,createdTime,modifiedTime,"
+    "closedTime,dueDate,responseDueDate,isOverDue,isResponseOverdue"
+)
+BUSINESSES = ["SY Comms", "SY Plus", "Other"]
+_DESK_METRIC_CACHE = {}       # ticket id -> raw metrics dict (never changes once a ticket has been answered)
+_DESK_METRIC_LOCK = None
+
+
+def _desk_domain():
+    try:
+        return str(st.secrets["zoho"].get("desk_domain") or DESK_DOMAIN_DEFAULT).rstrip("/")
+    except Exception:
+        return DESK_DOMAIN_DEFAULT
+
+
+def _desk_ts(raw):
+    """Desk times are UTC ISO strings -> naive UK local time (NaT when missing/unreadable)."""
+    if not raw:
+        return pd.NaT
+    try:
+        t = pd.to_datetime(raw, utc=True)
+        return t.tz_convert(UK_TZ).tz_localize(None)
+    except Exception:
+        return pd.NaT
+
+
+def _truthy(v):
+    return v is True or str(v).strip().lower() in ("true", "1", "yes")
+
+
+def fmt_dur(seconds):
+    """'45m', '3h 20m', '2d 04h' for response / resolution times."""
+    if seconds is None or pd.isna(seconds):
+        return "-"
+    seconds = int(round(seconds))
+    if seconds >= 86400:
+        return f"{seconds // 86400}d {seconds % 86400 // 3600:02d}h"
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def desk_org():
+    """(org id, list of orgs seen, error). `desk_org_id` in the [zoho] secrets overrides the lookup."""
+    try:
+        forced = st.secrets["zoho"].get("desk_org_id")
+    except Exception:
+        forced = None
+    if forced:
+        return str(forced), [], ""
+    token = get_access_token()
+    try:
+        resp = requests.get(f"{_desk_domain()}/api/v1/organizations", headers={"Authorization": f"Zoho-oauthtoken {token}"}, timeout=30)
+    except Exception as err:
+        return None, [], f"could not reach Zoho Desk: {err}"
+    if resp.status_code != 200:
+        return None, [], f"status {resp.status_code}: {resp.text[:300]}"
+    orgs = resp.json().get("data", [])
+    if not orgs:
+        return None, [], "Zoho Desk returned no organisations for this token"
+    return str(orgs[0].get("id")), [f"{o.get('companyName') or o.get('portalName')} ({o.get('id')})" for o in orgs], ""
+
+
+def _desk_headers():
+    org, _orgs, err = desk_org()
+    if not org:
+        raise RuntimeError(err)
+    return {"Authorization": f"Zoho-oauthtoken {get_access_token()}", "orgId": org}
+
+
+def _desk_get(path, params=None, headers=None):
+    resp = requests.get(f"{_desk_domain()}{path}", headers=headers or _desk_headers(), params=params or {}, timeout=40)
+    body = None
+    if resp.status_code == 200:
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+    return resp.status_code, body, resp.text[:300]
+
+
+def _desk_pages(path, headers, base, extra=None, cap=20):
+    """All records of a small Desk list (departments, agents)."""
+    out, off = [], base
+    for _ in range(cap):
+        code, body, text = _desk_get(path, {"limit": 100, "from": off, **(extra or {})}, headers)
+        if code != 200 or not body:
+            if code not in (200, 204):
+                raise RuntimeError(f"{path}: status {code}: {text}")
+            break
+        rows = body.get("data", [])
+        out.extend(rows)
+        if len(rows) < 100:
+            break
+        off += 100
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def desk_from_base():
+    """Desk's `from` offset is 0- or 1-based depending on the endpoint's mood; look at two tiny pages to see which."""
+    headers = _desk_headers()
+    c0, b0, _t0 = _desk_get("/api/v1/tickets", {"limit": 2, "from": 0}, headers)
+    c1, b1, _t1 = _desk_get("/api/v1/tickets", {"limit": 2, "from": 1}, headers)
+    a = [r.get("id") for r in (b0 or {}).get("data", [])]
+    b = [r.get("id") for r in (b1 or {}).get("data", [])]
+    if len(a) >= 2 and b and a[1] == b[0]:
+        return 0
+    return 1
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def desk_lookups():
+    """({department id: name}, {agent id: name}, diag text)."""
+    headers = _desk_headers()
+    base = desk_from_base()
+    depts = {str(d.get("id")): d.get("name") or str(d.get("id")) for d in _desk_pages("/api/v1/departments", headers, base)}
+    agents = {}
+    try:
+        for a in _desk_pages("/api/v1/agents", headers, base):
+            nm = (a.get("name") or f"{a.get('firstName') or ''} {a.get('lastName') or ''}").strip()
+            agents[str(a.get("id"))] = nm or a.get("emailId") or str(a.get("id"))
+        note = ""
+    except Exception as err:  # agent names are a nicety: ids still work
+        note = f"couldn't read the agent list ({err})"
+    return depts, agents, note
+
+
+def _ticket_row(r, depts, agents):
+    status = str(r.get("status") or "")
+    stype = str(r.get("statusType") or "")
+    created, modified = _desk_ts(r.get("createdTime")), _desk_ts(r.get("modifiedTime"))
+    closed_flag = stype.lower() == "closed" or status.lower() in ("closed", "resolved")
+    closed = _desk_ts(r.get("closedTime")) if closed_flag else pd.NaT
+    if closed_flag and pd.isna(closed):
+        closed = modified  # a Resolved ticket with no closed time: the last change is the best guess
+    aid = r.get("assigneeId")
+    return {
+        "Ticket ID": str(r.get("id") or ""), "Number": str(r.get("ticketNumber") or ""), "Subject": r.get("subject") or "",
+        "Dept ID": str(r.get("departmentId") or ""),
+        "Department": depts.get(str(r.get("departmentId")), str(r.get("departmentId") or "(none)")),
+        "Agent": agents.get(str(aid), str(aid)) if aid else "Unassigned",
+        "Status": status, "Is closed": bool(closed_flag), "Priority": r.get("priority") or "", "Channel": r.get("channel") or "",
+        "Created": created, "Modified": modified, "Closed": closed,
+        "Overdue": _truthy(r.get("isOverDue")), "Response overdue": _truthy(r.get("isResponseOverdue")),
+    }
+
+
+TICKET_COLS = ["Ticket ID", "Number", "Subject", "Dept ID", "Department", "Agent", "Status", "Is closed", "Priority",
+               "Channel", "Created", "Modified", "Closed", "Overdue", "Response overdue"]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_desk_tickets(since_iso):
+    """Tickets modified on/after `since_iso` (newest change first, so we can stop as soon as we pass it) - that covers
+    everything opened OR closed since then. Returns (DataFrame, diag dict)."""
+    since = _desk_ts(since_iso)
+    headers = _desk_headers()
+    base = desk_from_base()
+    depts, agents, note = desk_lookups()
+    diag = {"pages": 0, "tickets": 0, "capped": False, "variant": "", "sort": "", "raw_keys": "", "error": "", "base": base,
+            "lookup_note": note, "oldest": None}
+    variants = [
+        ("custom field list, newest change first", {"fields": DESK_TICKET_FIELDS, "sortBy": "-modifiedTime"}, "modifiedTime"),
+        ("newest change first", {"sortBy": "-modifiedTime"}, "modifiedTime"),
+        ("custom field list, newest created first", {"fields": DESK_TICKET_FIELDS, "sortBy": "-createdTime"}, "createdTime"),
+        ("newest created first", {"sortBy": "-createdTime"}, "createdTime"),
+        ("plain list", {}, "modifiedTime"),
+    ]
+    rows, picked, off = [], None, base
+    for _ in range(DESK_MAX_PAGES):
+        data = None
+        for name, extra, sort_key in ([picked] if picked else variants):
+            code, body, text = _desk_get("/api/v1/tickets", {"limit": DESK_PAGE, "from": off, **extra}, headers)
+            if code == 200:
+                data, picked = (body or {}).get("data", []), (name, extra, sort_key)
+                break
+            if code == 204:
+                data, picked = [], (name, extra, sort_key)
+                break
+            diag["error"] = f"status {code}: {text}"
+        if data is None:
+            if not rows:
+                raise RuntimeError(f"Zoho Desk wouldn't list tickets ({diag['error']})")
+            diag["capped"] = True
+            break
+        diag["error"] = "" if data else diag["error"]
+        diag["pages"] += 1
+        if not diag["raw_keys"] and data:
+            diag["raw_keys"] = ", ".join(sorted(data[0].keys()))
+            diag["variant"], diag["sort"] = picked[0], picked[2]
+        rows.extend(_ticket_row(r, depts, agents) for r in data)
+        if len(data) < DESK_PAGE:
+            break
+        edge = _desk_ts(data[-1].get(picked[2]))
+        if pd.notna(edge) and pd.notna(since) and edge < since:
+            break
+        off += DESK_PAGE
+    else:
+        diag["capped"] = True
+    df = pd.DataFrame(rows, columns=TICKET_COLS).drop_duplicates("Ticket ID")
+    for c in ("Created", "Modified", "Closed"):
+        df[c] = pd.to_datetime(df[c], errors="coerce")
+    diag["tickets"] = len(df)
+    diag["oldest"] = df["Modified" if diag["sort"] == "modifiedTime" else "Created"].min() if len(df) else None
+    return df, diag
+
+
+def _metric_lock():
+    global _DESK_METRIC_LOCK
+    if _DESK_METRIC_LOCK is None:
+        import threading
+        _DESK_METRIC_LOCK = threading.Lock()
+    return _DESK_METRIC_LOCK
+
+
+def _dur_to_seconds(v):
+    """'00:45', '01:02:03', '1 Days 02:30 Hrs', '45 Mins' -> seconds. Anything else (including bare numbers) -> None."""
+    if v is None:
+        return None
+    text = str(v).strip()
+    m = re.fullmatch(r"(?:(\d+)\s*d(?:ays?)?\s*)?(\d{1,3}):(\d{2})(?::(\d{2}))?\s*(?:hrs?|hours?)?", text, re.I)
+    if m:
+        d, h, mi, s_ = (int(x) if x else 0 for x in m.groups())
+        return d * 86400 + h * 3600 + mi * 60 + s_
+    parts = re.findall(r"(\d+)\s*(d|h|m|s)", text.lower())
+    if parts and re.fullmatch(r"(?:\d+\s*(?:days?|d|hrs?|hours?|h|mins?|minutes?|m|secs?|seconds?|s)\s*)+", text.lower()):
+        mult = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+        return sum(int(n) * mult[u] for n, u in parts)
+    return None
+
+
+def first_response_seconds(metrics, created):
+    """From a ticket's metrics block: seconds from creation to the first agent response, or None."""
+    if not isinstance(metrics, dict):
+        return None
+    keyed = {re.sub(r"[^a-z]", "", k.lower()): v for k, v in metrics.items()}
+    for key in ("firstresponsetime", "firstresponse", "firstresponsedate"):
+        if key in keyed:
+            v = keyed[key]
+            if isinstance(v, str) and re.match(r"\d{4}-\d{2}-\d{2}", v):
+                t = _desk_ts(v)
+                return max((t - created).total_seconds(), 0) if pd.notna(t) and pd.notna(created) else None
+            return _dur_to_seconds(v)
+    for k, v in keyed.items():
+        if "response" in k and "business" not in k and "first" in k:
+            return _dur_to_seconds(v)
+    return None
+
+
+def desk_metrics_for(ids):
+    """First-response information for each ticket id (cached across runs). Returns (id -> metrics dict, diag)."""
+    from concurrent.futures import ThreadPoolExecutor
+    headers = _desk_headers()
+    diag = {"error": "", "sample": "", "asked": 0}
+
+    def one(tid):
+        with _metric_lock():
+            if tid in _DESK_METRIC_CACHE:
+                return _DESK_METRIC_CACHE[tid]
+        try:
+            code, body, text = _desk_get(f"/api/v1/tickets/{tid}/metrics", None, headers)
+        except Exception as err:
+            diag["error"] = diag["error"] or f"could not reach Zoho Desk: {err}"
+            return None
+        if code != 200 or not isinstance(body, dict):
+            if code != 204:
+                diag["error"] = diag["error"] or f"status {code}: {text}"
+            return None
+        with _metric_lock():
+            _DESK_METRIC_CACHE[tid] = body
+        diag["sample"] = diag["sample"] or str(body)[:400]
+        return body
+
+    ids = list(ids)
+    diag["asked"] = len(ids)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        got = dict(zip(ids, pool.map(one, ids)))
+    return got, diag
+
+
+def _guess_business(dept_name):
+    n = dept_name.lower()
+    if "plus" in n or "syplus" in n or "sy+" in n:
+        return "SY Plus"
+    if "comm" in n:
+        return "SY Comms"
+    return "Other"
+
+
+def _grouped_bars(rows):
+    """rows: [(label, series, count)] - side-by-side dark columns; falls back to stacked on an old Altair."""
+    try:
+        chart_df = pd.DataFrame(rows, columns=["Bin", "Series", "Count"])
+        chart_df["Order"] = chart_df.groupby("Series").cumcount()
+        names = list(dict.fromkeys(chart_df["Series"]))
+        palette = {"Opened": "#7C83FF", "Closed": "#34D399"}
+        chart = (
+            alt.Chart(chart_df)
+            .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+            .encode(
+                x=alt.X("Bin:N", sort=alt.EncodingSortField("Order"), title="", axis=alt.Axis(labelAngle=0, labelOverlap=True)),
+                xOffset=alt.XOffset("Series:N"),
+                y=alt.Y("Count:Q", title="", axis=alt.Axis(tickMinStep=1)),
+                color=alt.Color("Series:N", scale=alt.Scale(domain=names, range=[palette.get(n, "#38D6F5") for n in names]),
+                                legend=alt.Legend(orient="top", title=None, labelColor="#8C98B0")),
+                tooltip=["Bin", "Series", "Count"],
+            )
+            .properties(height=210)
+            .configure(background="transparent")
+            .configure_axis(labelColor="#8C98B0", titleColor="#8C98B0", gridColor="#1C2740", domainColor="#26324D", tickColor="#26324D")
+            .configure_view(strokeOpacity=0)
+        )
+        try:
+            st.altair_chart(chart, width="stretch", theme=None)
+        except TypeError:
+            st.altair_chart(chart, use_container_width=True, theme=None)
+    except Exception:
+        render_bins_chart(rows)
+
+
+def _bucket_bars(values, edges, labels):
+    """Counts of `values` (seconds) in the buckets between `edges`, drawn as a simple dark bar chart."""
+    counts = [0] * len(labels)
+    for v in values:
+        for i in range(len(labels)):
+            hi = edges[i + 1] if i + 1 < len(edges) else float("inf")
+            if edges[i] <= v < hi:
+                counts[i] += 1
+                break
+    render_bins_chart([(lab, "Tickets", n) for lab, n in zip(labels, counts)], height=170)
+
+
+def render_activity():
+    today_d = now_uk.date()
+    st.session_state.setdefault("act_ref", today_d)
+
+    with st.container(key="card-act-pick"):
+        section_header(1, "Activity", "Support tickets from Zoho Desk - SY Comms and SY Plus together.")
+        pc1, pc2 = st.columns([1, 2])
+        tf = pc1.selectbox("Time frame", ACT_TIMEFRAMES, index=1, key="act_tf")
+        ref = st.session_state["act_ref"]
+        s0, e0 = period_bounds(tf, ref)
+        nav = st.columns([1, 1, 1, 4])
+        if nav[0].button("Previous", key="act_prev", **FULL_WIDTH):
+            st.session_state["act_ref"] = shift_period(tf, ref, -1)
+        if nav[1].button(f"This {tf.lower()}", key="act_now", **FULL_WIDTH):
+            st.session_state["act_ref"] = today_d
+        if nav[2].button("Next", key="act_next", **FULL_WIDTH):
+            st.session_state["act_ref"] = shift_period(tf, ref, 1)
+        ref = st.session_state["act_ref"]
+        start, end = period_bounds(tf, ref)
+        pstart, pend = period_bounds(tf, shift_period(tf, ref, -1))
+        if tf in ("Week", "Month"):
+            pend = min(pend, pstart + (min(end, today_d) - start))  # same elapsed days when this period is still running
+        label = period_label(tf, start, end)
+        compare_label = "the same point last " + tf.lower() if end > today_d else f"the previous {tf.lower()}"
+        pc2.markdown(f"**{label}**  \n:gray[compared with {compare_label}]")
+
+        try:
+            org, orgs, org_err = desk_org()
+            if not org:
+                raise RuntimeError(org_err)
+            depts, agents, lookup_note = desk_lookups()
+            with st.spinner("Fetching tickets from Zoho Desk..."):
+                tickets, tdiag = load_desk_tickets((datetime.combine(pstart, datetime.min.time()) - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z"))
+        except Exception as err:
+            st.warning(
+                "Couldn't read tickets from Zoho Desk. The Zoho token needs the Desk scopes "
+                "(Desk.tickets.READ, Desk.basic.READ, Desk.settings.READ) - the token helper in the sidebar can make a new one. "
+                f"Details: {err}"
+            )
+            return
+
+    # ---- which business is each department
+    with st.expander("Which business is each department?"):
+        st.caption("Guessed from the department names - change any that are wrong. Used to split SY Comms from SY Plus.")
+        biz_of = {}
+        dcols = st.columns(3)
+        for i, (did, dname) in enumerate(sorted(depts.items(), key=lambda kv: kv[1].lower())):
+            guess = _guess_business(dname)
+            biz_of[did] = dcols[i % 3].selectbox(dname, BUSINESSES, index=BUSINESSES.index(guess), key=f"act_dept_{did}")
+    tickets = tickets.assign(Business=tickets["Dept ID"].map(biz_of).fillna("Other"))
+
+    def slice_(a, b):
+        opened = tickets[_between(tickets["Created"], a, b)]
+        closed = tickets[tickets["Is closed"] & _between(tickets["Closed"], a, b)]
+        return opened, closed
+
+    opened, closed = slice_(start, end)
+    p_opened, p_closed = slice_(pstart, pend)
+
+    # ---- first response times: looked up one ticket at a time, newest first, for the tickets opened in each period
+    def pick_ids(df):
+        return list(df.sort_values("Created", ascending=False)["Ticket ID"].head(DESK_METRICS_CAP))
+
+    mdiag = {"error": "", "sample": "", "asked": 0}
+    try:
+        m_now, mdiag = desk_metrics_for(pick_ids(opened) + pick_ids(p_opened))
+    except Exception as err:
+        m_now, mdiag = {}, {"error": str(err), "sample": "", "asked": 0}
+
+    def with_fr(df):
+        df = df.copy()
+        df["First response (s)"] = [first_response_seconds(m_now.get(t), c) for t, c in zip(df["Ticket ID"], df["Created"])]
+        return df
+
+    opened, p_opened = with_fr(opened), with_fr(p_opened)
+    closed = closed.assign(**{"Resolution (s)": (closed["Closed"] - closed["Created"]).dt.total_seconds()})
+    p_closed = p_closed.assign(**{"Resolution (s)": (p_closed["Closed"] - p_closed["Created"]).dt.total_seconds()})
+    fr, p_fr = opened["First response (s)"].dropna(), p_opened["First response (s)"].dropna()
+    res, p_res = closed["Resolution (s)"].dropna(), p_closed["Resolution (s)"].dropna()
+    have_fr = len(fr) > 0
+
+    # ---- scorecard
+    with st.container(key="card-act-score"):
+        section_header(2, "Scorecard", f"{label}  ·  opened = created in the period, closed = closed or resolved in the period")
+        render_html('<div class="pe-subhead"><span class="n">Tickets</span></div>')
+        net = len(opened) - len(closed)
+        sub_o, tone_o = delta_sub(len(opened), len(p_opened), lower_is_better=True)
+        sub_c, tone_c = delta_sub(len(closed), len(p_closed))
+        ratio = len(closed) / len(opened) * 100 if len(opened) else 0.0
+        tiles = [
+            ("Tickets opened", f"{len(opened):,}", "", sub_o, ""),
+            ("Tickets closed", f"{len(closed):,}", "good", sub_c, tone_c),
+            ("Backlog change", f"{net:+,}", "warn" if net > 0 else "good",
+             "more opened than closed" if net > 0 else ("more closed than opened" if net < 0 else "level"), ""),
+            ("Closed vs opened", f"{ratio:.0f}%", "cyan", f"{len(closed):,} closed / {len(opened):,} opened", ""),
+        ]
+        for col, (lab, val, t_, sub_, st_) in zip(st.columns(4), tiles):
+            with col:
+                render_html(kpi_tile(lab, val, tone=t_, sub=sub_, sub_tone=st_))
+        render_html('<div class="pe-subhead"><span class="n">Response and resolution times</span></div>')
+        sub_fr = delta_sub(fr.mean(), p_fr.mean(), fmt=fmt_dur, lower_is_better=True) if (have_fr and len(p_fr)) else ("", "")
+        sub_res = delta_sub(res.mean(), p_res.mean(), fmt=fmt_dur, lower_is_better=True) if (len(res) and len(p_res)) else ("", "")
+        late = int(opened["Response overdue"].sum())
+        p_late = int(p_opened["Response overdue"].sum())
+        sub_late = delta_sub(late, p_late, lower_is_better=True)
+        tiles2 = [
+            ("Avg first response", fmt_dur(fr.mean()) if have_fr else "n/a", "", sub_fr[0] or ("" if have_fr else "Desk gave no first-response times"), sub_fr[1]),
+            ("Median first response", fmt_dur(fr.median()) if have_fr else "n/a", "cyan",
+             f"{len(fr):,} of {len(opened):,} tickets measured" if have_fr else "", ""),
+            ("Avg time to close", fmt_dur(res.mean()) if len(res) else "n/a", "warn", sub_res[0], sub_res[1]),
+            ("Past response deadline", f"{late:,}", "bad" if late else "good", sub_late[0], sub_late[1]),
+        ]
+        for col, (lab, val, t_, sub_, st_) in zip(st.columns(4), tiles2):
+            with col:
+                render_html(kpi_tile(lab, val, tone=t_, sub=sub_, sub_tone=st_))
+        by_biz = tickets.assign(_o=_between(tickets["Created"], start, end), _c=tickets["Is closed"] & _between(tickets["Closed"], start, end))
+        biz_txt = ", ".join(
+            f"**{b}** {int(by_biz.loc[by_biz['Business'] == b, '_o'].sum())} opened / {int(by_biz.loc[by_biz['Business'] == b, '_c'].sum())} closed"
+            for b in BUSINESSES if (by_biz["Business"] == b).any()
+        )
+        points = [f"**{len(opened):,}** ticket(s) opened and **{len(closed):,}** closed in {label} (previous: {len(p_opened):,} / {len(p_closed):,})."]
+        if biz_txt:
+            points.append(biz_txt + ".")
+        if have_fr:
+            points.append(f"First responses took **{fmt_dur(fr.mean())}** on average (median **{fmt_dur(fr.median())}**).")
+        if len(res):
+            points.append(f"Tickets closed in the period took **{fmt_dur(res.mean())}** on average from opening to closing.")
+        render_html(
+            '<div class="pe-callout">'
+            + "<br>".join("• " + md_bold(p, lambda t, b: f"<b>{esc(t)}</b>" if b else esc(t)) for p in points)
+            + "</div>"
+        )
+
+    # ---- over time
+    with st.container(key="card-act-time"):
+        gran = {"D": "Per day", "W": "Per week", "M": "Per month"}[_bin_spec(tf)]
+        section_header(3, "Opened and closed over time", f"{gran} across {label}.")
+        o_bins = bin_counts(opened["Created"], start, end, tf)
+        c_bins = bin_counts(closed["Closed"], start, end, tf)
+        _grouped_bars([(lab, "Opened", n) for lab, n in o_bins] + [(lab, "Closed", n) for lab, n in c_bins])
+
+    # ---- businesses and departments
+    with st.container(key="card-act-biz"):
+        section_header(4, "SY Comms and SY Plus", "The whole company, split by the business each department belongs to.")
+        rows_b = []
+        for b in BUSINESSES:
+            sub_t = tickets[tickets["Business"] == b]
+            if sub_t.empty:
+                continue
+            o_b = sub_t[_between(sub_t["Created"], start, end)]
+            c_b = sub_t[sub_t["Is closed"] & _between(sub_t["Closed"], start, end)]
+            res_b = (c_b["Closed"] - c_b["Created"]).dt.total_seconds().dropna()
+            fr_b = opened.loc[opened["Business"] == b, "First response (s)"].dropna()
+            rows_b.append({"Business": b, "Opened": len(o_b), "Closed": len(c_b),
+                           "Avg first response": fmt_dur(fr_b.mean()) if len(fr_b) else "-",
+                           "Avg time to close": fmt_dur(res_b.mean()) if len(res_b) else "-",
+                           "Past response deadline": int(o_b["Response overdue"].sum())})
+        st.caption("Tickets opened and closed")
+        if rows_b:
+            _grouped_bars([(r["Business"], "Opened", r["Opened"]) for r in rows_b] + [(r["Business"], "Closed", r["Closed"]) for r in rows_b])
+            st.caption("By business")
+            st.dataframe(pd.DataFrame(rows_b), hide_index=True, **DF_WIDTH)
+        else:
+            st.caption("No tickets found.")
+        dep = (
+            tickets.assign(_o=_between(tickets["Created"], start, end), _c=tickets["Is closed"] & _between(tickets["Closed"], start, end))
+            .groupby(["Business", "Department"]).agg(Opened=("_o", "sum"), Closed=("_c", "sum")).reset_index()
+        )
+        dep = dep[(dep["Opened"] > 0) | (dep["Closed"] > 0)].sort_values(["Opened", "Closed"], ascending=False)
+        if not dep.empty:
+            st.caption("By department")
+            st.dataframe(dep, hide_index=True, **DF_WIDTH)
+
+    # ---- people
+    with st.container(key="card-act-people"):
+        section_header(5, "Who handled the tickets", "Tickets by the agent they're assigned to.")
+        o_ag, c_ag = opened.groupby("Agent").size(), closed.groupby("Agent").size()
+        agents_seen = sorted(set(o_ag.index) | set(c_ag.index), key=str.lower)
+        rows_p = []
+        for ag in agents_seen:
+            c_a = closed[closed["Agent"] == ag]
+            o_a = opened[opened["Agent"] == ag]
+            res_a = c_a["Resolution (s)"].dropna()
+            fr_a = o_a["First response (s)"].dropna()
+            handled = len(set(o_a["Ticket ID"]) | set(c_a["Ticket ID"]))
+            rows_p.append({"Agent": ag, "Handled": handled, "Opened (assigned)": len(o_a), "Closed": len(c_a),
+                           "Avg first response": fmt_dur(fr_a.mean()) if len(fr_a) else "-",
+                           "Avg time to close": fmt_dur(res_a.mean()) if len(res_a) else "-",
+                           "Past response deadline": int(o_a["Response overdue"].sum()),
+                           "_fr": fr_a.mean() if len(fr_a) else float("nan")})
+        pc_l, pc_r = st.columns(2)
+        with pc_l:
+            st.caption("Tickets closed per person")
+            if c_ag.empty:
+                st.caption("No tickets closed in this period.")
+            else:
+                render_leaderboard(c_ag.sort_values(ascending=False).head(12), "Agent", "Tickets closed")
+        with pc_r:
+            st.caption("Average first response (fastest first)")
+            fr_rows = sorted([r for r in rows_p if pd.notna(r["_fr"])], key=lambda r: r["_fr"])
+            if not fr_rows:
+                st.caption("No first-response times available for this period.")
+            else:
+                st.dataframe(pd.DataFrame([{"Agent": r["Agent"], "Avg first response": r["Avg first response"]} for r in fr_rows]),
+                             hide_index=True, **DF_WIDTH)
+        if rows_p:
+            st.dataframe(pd.DataFrame(rows_p).drop(columns=["_fr"]).sort_values("Handled", ascending=False), hide_index=True, **DF_WIDTH)
+
+    # ---- response times
+    with st.container(key="card-act-resp"):
+        section_header(6, "Response and resolution times", "How quickly tickets are answered and closed.")
+        rc1, rc2 = st.columns(2)
+        with rc1:
+            st.caption("First response time - tickets opened in the period")
+            if have_fr:
+                _bucket_bars(list(fr), [0, 900, 3600, 4 * 3600, 24 * 3600], ["< 15 min", "15-60 min", "1-4 hrs", "4-24 hrs", "> 24 hrs"])
+            else:
+                st.caption("Zoho Desk didn't return first-response times for these tickets.")
+        with rc2:
+            st.caption("Time to close - tickets closed in the period")
+            if len(res):
+                _bucket_bars(list(res), [0, 3600, 4 * 3600, 24 * 3600, 3 * 86400, 7 * 86400],
+                             ["< 1 hr", "1-4 hrs", "4-24 hrs", "1-3 days", "3-7 days", "> 7 days"])
+            else:
+                st.caption("No tickets closed in this period.")
+        st.caption("Slowest to close (closed in the period)")
+        if len(res):
+            slow = closed.dropna(subset=["Resolution (s)"]).sort_values("Resolution (s)", ascending=False).head(10)
+            st.dataframe(
+                pd.DataFrame({
+                    "Ticket": slow["Number"], "Subject": slow["Subject"], "Business": slow["Business"], "Agent": slow["Agent"],
+                    "Opened": slow["Created"].dt.strftime("%d/%m/%Y %H:%M"), "Closed": slow["Closed"].dt.strftime("%d/%m/%Y %H:%M"),
+                    "Took": slow["Resolution (s)"].map(fmt_dur),
+                }), hide_index=True, **DF_WIDTH)
+        else:
+            st.caption("None.")
+        if have_fr:
+            st.caption("Slowest first responses (opened in the period)")
+            slow_fr = opened.dropna(subset=["First response (s)"]).sort_values("First response (s)", ascending=False).head(10)
+            st.dataframe(
+                pd.DataFrame({
+                    "Ticket": slow_fr["Number"], "Subject": slow_fr["Subject"], "Business": slow_fr["Business"], "Agent": slow_fr["Agent"],
+                    "Opened": slow_fr["Created"].dt.strftime("%d/%m/%Y %H:%M"), "First response took": slow_fr["First response (s)"].map(fmt_dur),
+                }), hide_index=True, **DF_WIDTH)
+
+    # ---- how it was found
+    with st.expander("How these tickets were found"):
+        oldest_txt = f"; oldest change {tdiag['oldest']:%d %b %Y}" if tdiag["oldest"] is not None and pd.notna(tdiag["oldest"]) else ""
+        st.write(
+            f"Zoho Desk returned **{tdiag['tickets']:,}** ticket(s) changed since {pstart.strftime('%d %b %Y')} "
+            f"({tdiag['pages']} page(s), {tdiag['variant'] or 'n/a'}{oldest_txt})."
+        )
+        if tdiag["capped"]:
+            st.warning(f"That's more than {DESK_MAX_PAGES * DESK_PAGE:,} tickets, so the oldest changes were left out - shorten the time frame for exact numbers.")
+        if tdiag.get("error"):
+            st.caption(f"Last Zoho message: {tdiag['error']}")
+        if lookup_note:
+            st.caption(f"Agent names: {lookup_note}")
+        st.caption(
+            f"First-response times were looked up for up to {DESK_METRICS_CAP} of the newest tickets opened in each of the two periods: "
+            f"{len(fr):,} of {len(opened):,} in this period were measured."
+        )
+        if mdiag.get("error"):
+            st.warning(f"Zoho Desk wouldn't give some ticket metrics - {mdiag['error']}")
+        st.caption("Fields on a ticket in the list (technical):")
+        st.code(tdiag["raw_keys"] or "(none)", language=None)
+        if mdiag.get("sample"):
+            st.caption("One ticket's metrics as Zoho Desk sent them (technical):")
+            st.code(mdiag["sample"], language=None)
+        if orgs:
+            st.caption("Desk organisation(s) seen: " + "; ".join(orgs))
+        st.caption("Closed means Zoho Desk's status is Closed or Resolved; a ticket counts as closed on the day it was closed.")
+
+    report["activity"] = {"label": label, "opened": len(opened), "closed": len(closed)}
+
+
+with tab_activity:
+    render_activity()
 
 
 # =====================================================================
